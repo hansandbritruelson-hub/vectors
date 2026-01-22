@@ -1841,6 +1841,21 @@ function handleFileUpload(event: Event) {
                          @input="e => updateSelected('blur', Number((e.target as HTMLInputElement).value), false)"
                          @change="e => updateSelected('blur', Number((e.target as HTMLInputElement).value), true)" />
 
+                  <label>Grayscale</label>
+                  <input type="range" min="0" max="1" step="0.05" :value="selectedObject.grayscale" 
+                         @input="e => updateSelected('grayscale', Number((e.target as HTMLInputElement).value), false)"
+                         @change="e => updateSelected('grayscale', Number((e.target as HTMLInputElement).value), true)" />
+
+                  <label>Sepia</label>
+                  <input type="range" min="0" max="1" step="0.05" :value="selectedObject.sepia" 
+                         @input="e => updateSelected('sepia', Number((e.target as HTMLInputElement).value), false)"
+                         @change="e => updateSelected('sepia', Number((e.target as HTMLInputElement).value), true)" />
+
+                  <label>Invert</label>
+                  <input type="range" min="0" max="1" step="0.05" :value="selectedObject.invert" 
+                         @input="e => updateSelected('invert', Number((e.target as HTMLInputElement).value), false)"
+                         @change="e => updateSelected('invert', Number((e.target as HTMLInputElement).value), true)" />
+
                   <div class="actions">
                       <button class="ai-bg-btn-large" @click="removeSelectedBackground">✨ Remove Background (AI)</button>
                   </div>
@@ -1902,6 +1917,24 @@ function handleFileUpload(event: Event) {
                        :value="objects.find(o => o.id === targetImageId)?.blur" 
                        @input="e => executeCommand({ action: 'update', params: { id: targetImageId, blur: Number((e.target as HTMLInputElement).value) } })"
                        @change="e => executeCommand({ action: 'update', params: { id: targetImageId, blur: Number((e.target as HTMLInputElement).value), save_undo: true } })" />
+
+                <label>Grayscale</label>
+                <input type="range" min="0" max="1" step="0.05" 
+                       :value="objects.find(o => o.id === targetImageId)?.grayscale" 
+                       @input="e => executeCommand({ action: 'update', params: { id: targetImageId, grayscale: Number((e.target as HTMLInputElement).value) } })"
+                       @change="e => executeCommand({ action: 'update', params: { id: targetImageId, grayscale: Number((e.target as HTMLInputElement).value), save_undo: true } })" />
+
+                <label>Sepia</label>
+                <input type="range" min="0" max="1" step="0.05" 
+                       :value="objects.find(o => o.id === targetImageId)?.sepia" 
+                       @input="e => executeCommand({ action: 'update', params: { id: targetImageId, sepia: Number((e.target as HTMLInputElement).value) } })"
+                       @change="e => executeCommand({ action: 'update', params: { id: targetImageId, sepia: Number((e.target as HTMLInputElement).value), save_undo: true } })" />
+
+                <label>Invert</label>
+                <input type="range" min="0" max="1" step="0.05" 
+                       :value="objects.find(o => o.id === targetImageId)?.invert" 
+                       @input="e => executeCommand({ action: 'update', params: { id: targetImageId, invert: Number((e.target as HTMLInputElement).value) } })"
+                       @change="e => executeCommand({ action: 'update', params: { id: targetImageId, invert: Number((e.target as HTMLInputElement).value), save_undo: true } })" />
             </div>
           </section>
 

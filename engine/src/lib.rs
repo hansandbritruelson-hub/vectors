@@ -92,6 +92,9 @@ pub struct VectorObject {
     pub saturate: f64,
     pub hue_rotate: f64,
     pub blur: f64,
+    pub grayscale: f64,
+    pub sepia: f64,
+    pub invert: f64,
     pub image_data_url: Option<String>,
     #[serde(skip)]
     pub image: Option<HtmlImageElement>,
@@ -514,6 +517,9 @@ impl VectorEngine {
                         saturate: 1.0,
                         hue_rotate: 0.0,
                         blur: 0.0,
+                        grayscale: 0.0,
+                        sepia: 0.0,
+                        invert: 0.0,
                         image_data_url: Some(data_url),
                         image: None,
                         fill_gradient: None,
@@ -753,6 +759,7 @@ impl VectorEngine {
                                 shadow_offset_y: 0.0,
                                 sx: 0.0, sy: 0.0, sw: 0.0, sh: 0.0,
                                 brightness: 1.0, contrast: 1.0, saturate: 1.0, hue_rotate: 0.0, blur: 0.0,
+                                grayscale: 0.0, sepia: 0.0, invert: 0.0,
                                 image_data_url: None, image: None,
                                 fill_gradient: None, stroke_gradient: None, children: None,
                             });
@@ -797,6 +804,7 @@ impl VectorEngine {
                                 shadow_offset_y: 0.0,
                                 sx: 0.0, sy: 0.0, sw: 0.0, sh: 0.0,
                                 brightness: 1.0, contrast: 1.0, saturate: 1.0, hue_rotate: 0.0, blur: 0.0,
+                                grayscale: 0.0, sepia: 0.0, invert: 0.0,
                                 image_data_url: None, image: None,
                                 fill_gradient: None, stroke_gradient: None, children: None,
                             });
@@ -841,6 +849,7 @@ impl VectorEngine {
                                 shadow_offset_y: 0.0,
                                 sx: 0.0, sy: 0.0, sw: 0.0, sh: 0.0,
                                 brightness: 1.0, contrast: 1.0, saturate: 1.0, hue_rotate: 0.0, blur: 0.0,
+                                grayscale: 0.0, sepia: 0.0, invert: 0.0,
                                 image_data_url: None, image: None,
                                 fill_gradient: None, stroke_gradient: None, children: None,
                             });
@@ -907,6 +916,9 @@ impl VectorEngine {
             saturate: 1.0,
             hue_rotate: 0.0,
             blur: 0.0,
+            grayscale: 0.0,
+            sepia: 0.0,
+            invert: 0.0,
             image_data_url: None,
             image: None,
             fill_gradient: None,
@@ -950,6 +962,9 @@ impl VectorEngine {
             if let Some(v) = params["saturate"].as_f64() { obj.saturate = v; }
             if let Some(v) = params["hue_rotate"].as_f64() { obj.hue_rotate = v; }
             if let Some(v) = params["blur"].as_f64() { obj.blur = v; }
+            if let Some(v) = params["grayscale"].as_f64() { obj.grayscale = v; }
+            if let Some(v) = params["sepia"].as_f64() { obj.sepia = v; }
+            if let Some(v) = params["invert"].as_f64() { obj.invert = v; }
             if let Some(v) = params["text_content"].as_str() { obj.text_content = v.to_string(); }
             if let Some(v) = params["font_family"].as_str() { obj.font_family = v.to_string(); }
             if let Some(v) = params["font_size"].as_f64() { obj.font_size = v; }
@@ -1167,12 +1182,15 @@ impl VectorEngine {
         // Apply Filters
         if obj.shape_type == ShapeType::Image {
              let filter = format!(
-                "brightness({}%) contrast({}%) saturate({}%) hue-rotate({}deg) blur({}px)",
+                "brightness({}%) contrast({}%) saturate({}%) hue-rotate({}deg) blur({}px) grayscale({}%) sepia({}%) invert({}%)",
                 obj.brightness * 100.0,
                 obj.contrast * 100.0,
                 obj.saturate * 100.0,
                 obj.hue_rotate,
-                obj.blur
+                obj.blur,
+                obj.grayscale * 100.0,
+                obj.sepia * 100.0,
+                obj.invert * 100.0
             );
             ctx.set_filter(&filter);
         }
