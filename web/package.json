@@ -11,6 +11,7 @@
   "dependencies": {
     "@imgly/background-removal": "^1.7.0",
     "@mlc-ai/web-llm": "^0.2.80",
+    "lucide-vue-next": "^0.562.0",
     "vue": "^3.5.13",
     "wasm-pack": "^0.13.1"
   },

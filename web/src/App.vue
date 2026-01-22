@@ -2,8 +2,15 @@
 import { ref, onMounted, computed, watch, nextTick } from 'vue';
 import init, { VectorEngine } from './pkg/engine';
 import { aiService, type ModelStatus } from './ai';
+import LayerItem from './components/LayerItem.vue';
+import { 
+    MousePointer2, Square, Circle, PenTool, Crop, 
+    Star, Hexagon, Pipette, Wand2, Type, Upload,
+    Trash2, Copy, BringToFront, SendToBack, ChevronUp, ChevronDown,
+    Pencil, Eraser, Hand, Search, RotateCw
+} from 'lucide-vue-next';
 
-type Tool = 'select' | 'rect' | 'circle' | 'image' | 'bezier' | 'crop' | 'star' | 'poly' | 'eyedropper' | 'magic';
+type Tool = 'select' | 'rect' | 'circle' | 'image' | 'bezier' | 'crop' | 'star' | 'poly' | 'eyedropper' | 'magic' | 'text' | 'pencil' | 'eraser' | 'hand' | 'zoom' | 'rotate';
 
 const canvas = ref<HTMLCanvasElement | null>(null);
 const canvasContainer = ref<HTMLElement | null>(null);
@@ -21,12 +28,17 @@ const showShapesMenu = ref(false);
 const snapMode = ref(true);
 const objects = ref<any[]>([]);
 const imageMap = new Map<number, HTMLImageElement>();
-const selectedId = ref<number>(-1);
+const selectedIds = ref<number[]>([]); // Changed to array
 const isDragging = ref(false);
 const dragStart = ref({ x: 0, y: 0 });
 const lastMousePos = ref({ x: 0, y: 0 });
-const initialObjectState = ref<{ x: number, y: number, width: number, height: number } | null>(null);
+// Store initial state for all selected objects during drag
+const initialObjectsState = ref<Map<number, { x: number, y: number, width: number, height: number, rotation: number }>>(new Map());
 const needsRender = ref(true);
+
+const selectionBox = ref<{ x: number, y: number, w: number, h: number } | null>(null);
+const activeHandle = ref<{ id: number, type: string } | null>(null);
+
 
 watch(messages, () => {
     nextTick(() => {
@@ -79,15 +91,49 @@ const bezierState = ref({
     points: [] as BezierPoint[],
     currentObjId: -1,
     isSnapped: false,
+    isClosing: false,
+    mousePoint: null as { x: number, y: number } | null,
 });
 
-function getPathString(points: BezierPoint[]): string {
+const pencilState = ref({
+    isDrawing: false,
+    points: [] as { x: number, y: number }[],
+    currentObjId: -1,
+});
+
+function getPencilPathString(points: { x: number, y: number }[], offset = { x: 0, y: 0 }): string {
     if (points.length === 0) return '';
-    let d = `M ${points[0].x} ${points[0].y}`;
+    const ox = offset.x;
+    const oy = offset.y;
+    let d = `M ${points[0].x - ox} ${points[0].y - oy}`;
+    for (let i = 1; i < points.length; i++) {
+        d += ` L ${points[i].x - ox} ${points[i].y - oy}`;
+    }
+    return d;
+}
+
+function getPathString(points: BezierPoint[], isClosed: boolean = false, previewPoint: {x: number, y: number} | null = null, offset = { x: 0, y: 0 }): string {
+    if (points.length === 0) return '';
+    const ox = offset.x;
+    const oy = offset.y;
+    
+    let d = `M ${points[0].x - ox} ${points[0].y - oy}`;
+    
     for (let i = 1; i < points.length; i++) {
         const prev = points[i-1];
         const curr = points[i];
-        d += ` C ${prev.cout.x} ${prev.cout.y}, ${curr.cin.x} ${curr.cin.y}, ${curr.x} ${curr.y}`;
+        d += ` C ${prev.cout.x - ox} ${prev.cout.y - oy}, ${curr.cin.x - ox} ${curr.cin.y - oy}, ${curr.x - ox} ${curr.y - oy}`;
+    }
+
+    if (previewPoint && points.length > 0 && !isClosed) {
+        const prev = points[points.length - 1];
+        d += ` C ${prev.cout.x - ox} ${prev.cout.y - oy}, ${previewPoint.x - ox} ${previewPoint.y - oy}, ${previewPoint.x - ox} ${previewPoint.y - oy}`;
+    }
+
+    if (isClosed && points.length > 1) {
+        const prev = points[points.length - 1];
+        const curr = points[0];
+        d += ` C ${prev.cout.x - ox} ${prev.cout.y - oy}, ${curr.cin.x - ox} ${curr.cin.y - oy}, ${curr.x - ox} ${curr.y - oy} Z`;
     }
     return d;
 }
@@ -96,8 +142,14 @@ const hasImage = computed(() => {
     return objects.value.some(o => o.shape_type === 'Image');
 });
 
+const selectedObjects = computed(() => {
+    return objects.value.filter(o => selectedIds.value.includes(o.id));
+});
+
+// Primary object for property editing (usually the last selected)
 const selectedObject = computed(() => {
-  return objects.value.find(o => o.id === selectedId.value) || null;
+    if (selectedObjects.value.length === 0) return null;
+    return selectedObjects.value[selectedObjects.value.length - 1];
 });
 
 const targetImageId = computed(() => {
@@ -171,15 +223,37 @@ onMounted(async () => {
         
         // Tool Shortcuts
         if (e.key.toLowerCase() === 'v') activeTool.value = 'select';
-        if (e.key.toLowerCase() === 'r') activeTool.value = 'rect';
+        if (e.key.toLowerCase() === 'm') activeTool.value = 'rect';
+        if (e.key.toLowerCase() === 'r') activeTool.value = 'rotate';
         if (e.key.toLowerCase() === 'o') activeTool.value = 'circle';
         if (e.key.toLowerCase() === 's') activeTool.value = 'star';
         if (e.key.toLowerCase() === 'g') activeTool.value = 'poly';
         if (e.key.toLowerCase() === 'p') activeTool.value = 'bezier';
+        if (e.key.toLowerCase() === 'n') activeTool.value = 'pencil';
+        if (e.key.toLowerCase() === 'e') activeTool.value = 'eraser';
+        if (e.key.toLowerCase() === 'h') activeTool.value = 'hand';
+        if (e.key.toLowerCase() === 'z') activeTool.value = 'zoom';
         if (e.key.toLowerCase() === 'i') activeTool.value = 'eyedropper';
         if (e.key.toLowerCase() === 'm') activeTool.value = 'magic';
+        if (e.key.toLowerCase() === 't') activeTool.value = 'text';
         if (e.key.toLowerCase() === 'c' && hasImage.value) activeTool.value = 'crop';
         if (e.key === 'Backspace' || e.key === 'Delete') deleteSelected();
+
+        // Duplicate Shortcut
+        if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'd') {
+            if (selectedIds.value.length > 0) {
+                 // Send batch duplicate command? Or just duplicate primary?
+                 // Current engine supports one by one.
+                 // We'll just duplicate the primary one for now or iterate
+                 // The engine 'duplicate' command takes an ID and returns a NEW ID.
+                 // If we duplicate multiple, we probably want to select the new ones.
+                 // For simplicity, let's duplicate the *last* selected (primary).
+                 if (selectedObject.value) {
+                     executeCommand({ action: 'duplicate', params: { id: selectedObject.value.id } });
+                 }
+                e.preventDefault();
+            }
+        }
 
         // Undo/Redo Shortcuts
         if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') {
@@ -193,34 +267,25 @@ onMounted(async () => {
         }
 
         if (e.key === 'Enter' && bezierState.value.isDrawing) {
-             // ... existing enter logic ...
-             const pts = bezierState.value.points;
+            // Remove the "moving" point before finishing
+            bezierState.value.points.pop();
+            const pts = bezierState.value.points;
             if (pts.length > 0) {
-                let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+                let minX = Infinity, minY = Infinity;
                 pts.forEach(p => {
                     minX = Math.min(minX, p.x, p.cin.x, p.cout.x);
                     minY = Math.min(minY, p.y, p.cin.y, p.cout.y);
-                    maxX = Math.max(maxX, p.x, p.cin.x, p.cout.x);
-                    maxY = Math.max(maxY, p.y, p.cin.y, p.cout.y);
                 });
-                
-                const shiftedPts = pts.map(p => ({
-                    x: p.x - minX,
-                    y: p.y - minY,
-                    cin: { x: p.cin.x - minX, y: p.cin.y - minY },
-                    cout: { x: p.cout.x - minX, y: p.cout.y - minY }
-                }));
-                
-                const newD = getPathString(shiftedPts);
+
+                const newD = getPathString(pts, false, { x: minX, y: minY });
                 executeCommand({
                     action: 'update',
                     params: {
                         id: bezierState.value.currentObjId,
+                        path_data: newD,
                         x: minX,
                         y: minY,
-                        width: maxX - minX,
-                        height: maxY - minY,
-                        path_data: newD
+                        save_undo: true
                     }
                 });
             }
@@ -287,6 +352,21 @@ function renderLoop() {
       if (ctx) {
         engine.value.render(ctx);
 
+        // Draw Selection Box
+        if (selectionBox.value) {
+            ctx.save();
+            ctx.strokeStyle = '#4facfe';
+            ctx.lineWidth = 1;
+            ctx.setLineDash([4, 4]);
+            ctx.fillStyle = 'rgba(79, 172, 254, 0.1)';
+            
+            // The box coords are in screen space
+            const { x, y, w, h } = selectionBox.value;
+            ctx.fillRect(x, y, w, h);
+            ctx.strokeRect(x, y, w, h);
+            ctx.restore();
+        }
+
         // Draw Crop Overlay
         if (activeTool.value === 'crop' && cropState.value.isCropping) {
             ctx.save();
@@ -307,10 +387,72 @@ function renderLoop() {
             ctx.restore();
         }
 
+        // Draw Bezier Handles
+        if (activeTool.value === 'bezier' && bezierState.value.isDrawing) {
+            ctx.save();
+            ctx.translate(viewport.value.x, viewport.value.y);
+            ctx.scale(viewport.value.zoom, viewport.value.zoom);
+
+            const pts = bezierState.value.points;
+            pts.forEach((pt, i) => {
+                const isLast = i === pts.length - 1;
+                // Don't draw handles for the "moving" point unless it's being dragged
+                if (isLast && !isDragging.value) {
+                    // Just draw a small dot for the moving point
+                    ctx.fillStyle = '#4facfe';
+                    ctx.beginPath();
+                    ctx.arc(pt.x, pt.y, 3 / viewport.value.zoom, 0, Math.PI * 2);
+                    ctx.fill();
+                    return;
+                }
+
+                // Draw Anchor
+                ctx.fillStyle = isLast ? '#ff4f4f' : '#4facfe';
+                ctx.strokeStyle = 'white';
+                ctx.lineWidth = 1 / viewport.value.zoom;
+                ctx.beginPath();
+                ctx.rect(pt.x - 4 / viewport.value.zoom, pt.y - 4 / viewport.value.zoom, 8 / viewport.value.zoom, 8 / viewport.value.zoom);
+                ctx.fill();
+                ctx.stroke();
+
+                // Draw Handles
+                ctx.strokeStyle = '#4facfe';
+                ctx.lineWidth = 1 / viewport.value.zoom;
+                
+                // cout
+                if (pt.cout.x !== pt.x || pt.cout.y !== pt.y) {
+                    ctx.beginPath();
+                    ctx.moveTo(pt.x, pt.y);
+                    ctx.lineTo(pt.cout.x, pt.cout.y);
+                    ctx.stroke();
+                    ctx.beginPath();
+                    ctx.arc(pt.cout.x, pt.cout.y, 3 / viewport.value.zoom, 0, Math.PI * 2);
+                    ctx.stroke();
+                    ctx.fillStyle = 'white';
+                    ctx.fill();
+                }
+
+                // cin
+                if (pt.cin.x !== pt.x || pt.cin.y !== pt.y) {
+                    ctx.beginPath();
+                    ctx.moveTo(pt.x, pt.y);
+                    ctx.lineTo(pt.cin.x, pt.cin.y);
+                    ctx.stroke();
+                    ctx.beginPath();
+                    ctx.arc(pt.cin.x, pt.cin.y, 3 / viewport.value.zoom, 0, Math.PI * 2);
+                    ctx.stroke();
+                    ctx.fillStyle = 'white';
+                    ctx.fill();
+                }
+            });
+            ctx.restore();
+        }
+
         // Sync objects state for UI
         const json = engine.value.get_objects_json();
         objects.value = JSON.parse(json);
-        selectedId.value = engine.value.get_selected_id();
+        const selIdsJson = engine.value.get_selected_ids();
+        selectedIds.value = JSON.parse(selIdsJson);
       }
       needsRender.value = false;
   }
@@ -328,19 +470,19 @@ function executeCommand(cmd: any) {
 
 function handleWheel(e: WheelEvent) {
   if (!canvas.value || !engine.value) return;
-  e.preventDefault();
-
+  // e.preventDefault() is handled by @wheel.prevent in template, but good to keep logic clear
+  
   const rect = canvas.value.getBoundingClientRect();
   const mx = e.clientX - rect.left;
   const my = e.clientY - rect.top;
 
-  if (e.ctrlKey) {
-    // Pinch to zoom (macOS trackpad)
-    const zoomSensitivity = 0.005;
+  // Check for Pinch-to-zoom (Ctrl key is usually set by browser)
+  // or explicit command+wheel
+  if (e.ctrlKey || e.metaKey) {
+    const zoomSensitivity = 0.01;
     const delta = -e.deltaY * zoomSensitivity;
-    const newZoom = Math.max(0.01, Math.min(100, viewport.value.zoom * Math.exp(delta)));
+    const newZoom = Math.max(0.1, Math.min(50, viewport.value.zoom * Math.exp(delta)));
 
-    // World pos before zoom
     const wx = (mx - viewport.value.x) / viewport.value.zoom;
     const wy = (my - viewport.value.y) / viewport.value.zoom;
 
@@ -348,7 +490,7 @@ function handleWheel(e: WheelEvent) {
     viewport.value.x = mx - wx * newZoom;
     viewport.value.y = my - wy * newZoom;
   } else {
-    // Two-finger pan (macOS trackpad)
+    // Pan
     viewport.value.x -= e.deltaX;
     viewport.value.y -= e.deltaY;
   }
@@ -367,20 +509,65 @@ function handleMouseDown(e: MouseEvent) {
   dragStart.value = { x, y };
   lastMousePos.value = { x, y };
 
-  if (isSpacePressed.value) {
+  if (isSpacePressed.value || activeTool.value === 'hand') {
       isPanning.value = true;
       canvas.value.style.cursor = 'grabbing';
       return;
   }
 
-  isDragging.value = true;
+  isDragging.value = true; // Default to true, might set to false if box select
   needsRender.value = true;
 
   const worldPos = screenToWorld(x, y);
 
+  if (activeTool.value === 'pencil') {
+      const res = executeCommand({
+          action: 'add',
+          params: { 
+              type: 'Path', 
+              x: 0, y: 0, width: 0, height: 0, 
+              fill: 'transparent',
+              stroke: '#4facfe',
+              stroke_width: 2
+          }
+      });
+      if (res && res.id) {
+          pencilState.value.isDrawing = true;
+          pencilState.value.currentObjId = res.id;
+          pencilState.value.points = [{ x: worldPos.x, y: worldPos.y }];
+          engine.value.execute_command(JSON.stringify({ action: 'select', params: { id: res.id } }));
+      }
+      return;
+  }
+
+  if (activeTool.value === 'eraser') {
+      const idsStr = engine.value.select_point(x, y, false);
+      const ids = JSON.parse(idsStr);
+      if (ids.length > 0) {
+          executeCommand({ action: 'delete', params: { ids } });
+      }
+      return;
+  }
+
+  if (activeTool.value === 'zoom') {
+      const zoomFactor = e.altKey ? 0.5 : 2.0;
+      const newZoom = Math.max(0.1, Math.min(50, viewport.value.zoom * zoomFactor));
+      
+      const wx = (x - viewport.value.x) / viewport.value.zoom;
+      const wy = (y - viewport.value.y) / viewport.value.zoom;
+
+      viewport.value.zoom = newZoom;
+      viewport.value.x = x - wx * newZoom;
+      viewport.value.y = y - wy * newZoom;
+      
+      engine.value.set_viewport(viewport.value.x, viewport.value.y, viewport.value.zoom);
+      needsRender.value = true;
+      return;
+  }
+
   if (activeTool.value === 'bezier') {
       if (!bezierState.value.isDrawing) {
-          // Start new path
+          // Start new path at 0,0 to avoid origin-shift jumps
            const res = executeCommand({
                 action: 'add',
                 params: { 
@@ -395,62 +582,45 @@ function handleMouseDown(e: MouseEvent) {
             if (res && res.id) {
                 bezierState.value.isDrawing = true;
                 bezierState.value.currentObjId = res.id;
-                bezierState.value.points = [{ x: worldPos.x, y: worldPos.y, cin: {x: worldPos.x, y: worldPos.y}, cout: {x: worldPos.x, y: worldPos.y} }];
+                bezierState.value.points = [
+                    { x: worldPos.x, y: worldPos.y, cin: {x: worldPos.x, y: worldPos.y}, cout: {x: worldPos.x, y: worldPos.y} }
+                ];
+                bezierState.value.mousePoint = { x: worldPos.x, y: worldPos.y };
                 engine.value.execute_command(JSON.stringify({ action: 'select', params: { id: res.id } }));
             }
       } else {
           // Check for Snap-Close
           let isClose = false;
-          if (snapMode.value && bezierState.value.points.length > 2) {
-              const startPt = bezierState.value.points[0];
-              const dist = Math.sqrt((worldPos.x - startPt.x)**2 + (worldPos.y - startPt.y)**2);
-              if (dist < 15 / viewport.value.zoom) {
-                  isClose = true;
-              }
+          const startPt = bezierState.value.points[0];
+          const dist = Math.sqrt((worldPos.x - startPt.x)**2 + (worldPos.y - startPt.y)**2);
+          if (snapMode.value && dist < 15 / viewport.value.zoom) {
+              isClose = true;
           }
 
           if (isClose) {
-                // ... same closing logic ...
-                const pts = bezierState.value.points;
-                let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-                pts.forEach(p => {
-                    minX = Math.min(minX, p.x, p.cin.x, p.cout.x);
-                    minY = Math.min(minY, p.y, p.cin.y, p.cout.y);
-                    maxX = Math.max(maxX, p.x, p.cin.x, p.cout.x);
-                    maxY = Math.max(maxY, p.y, p.cin.y, p.cout.y);
-                });
-                
-                const shiftedPts = pts.map(p => ({
-                    x: p.x - minX,
-                    y: p.y - minY,
-                    cin: { x: p.cin.x - minX, y: p.cin.y - minY },
-                    cout: { x: p.cout.x - minX, y: p.cout.y - minY }
-                }));
-                
-                const newD = getPathString(shiftedPts) + " Z";
-                executeCommand({
-                    action: 'update',
-                    params: {
-                        id: bezierState.value.currentObjId,
-                        x: minX,
-                        y: minY,
-                        width: maxX - minX,
-                        height: maxY - minY,
-                        path_data: newD,
-                        save_undo: true
-                    }
-                });
-                
-                bezierState.value.isDrawing = false;
-                bezierState.value.points = [];
-                activeTool.value = 'select';
+                // Instead of finishing immediately, we set isClosing to true.
+                // This allows the user to drag handles on the closing point in handleMouseMove.
+                bezierState.value.isClosing = true;
+                bezierState.value.mousePoint = null; // No rubber band needed while closing
           } else {
-              // Add point
-              bezierState.value.points.push({ x: worldPos.x, y: worldPos.y, cin: {x: worldPos.x, y: worldPos.y}, cout: {x: worldPos.x, y: worldPos.y} });
-              const d = getPathString(bezierState.value.points);
+              // Commit the current point using world coordinates (relative to 0,0)
+              bezierState.value.points.push({ 
+                  x: worldPos.x, y: worldPos.y, 
+                  cin: {x: worldPos.x, y: worldPos.y}, 
+                  cout: {x: worldPos.x, y: worldPos.y} 
+              });
+              
+              const pts = bezierState.value.points;
+              // No normalization while drawing
+              const d = getPathString(pts, false, null, { x: 0, y: 0 });
               executeCommand({
                     action: 'update',
-                    params: { id: bezierState.value.currentObjId, path_data: d }
+                    params: { 
+                        id: bezierState.value.currentObjId, 
+                        path_data: d,
+                        x: 0,
+                        y: 0 
+                    }
                 });
           }
       }
@@ -458,16 +628,50 @@ function handleMouseDown(e: MouseEvent) {
   }
 
   if (activeTool.value === 'select') {
-    engine.value.select_at(x, y);
-    const sid = engine.value.get_selected_id();
-    if (sid !== -1) {
-        const obj = objects.value.find(o => o.id === sid);
-        if (obj) {
-            initialObjectState.value = { x: obj.x, y: obj.y, width: obj.width, height: obj.height };
-        }
-    } else {
-        initialObjectState.value = null;
+    // Check handles first
+    const handleHitStr = engine.value?.hit_test_handles(x, y);
+    const handleHit = handleHitStr ? JSON.parse(handleHitStr) : null;
+    
+    if (handleHit) {
+        activeHandle.value = { id: handleHit[0], type: handleHit[1] };
+        
+        // Prepare initial state for transformation
+        initialObjectsState.value.clear();
+        objects.value
+            .filter(o => selectedIds.value.includes(o.id))
+            .forEach(o => {
+                initialObjectsState.value.set(o.id, { x: o.x, y: o.y, width: o.width, height: o.height, rotation: o.rotation });
+            });
+        return;
     }
+
+    // 1. Perform selection
+    const idsStr = engine.value.select_point(x, y, e.shiftKey || e.metaKey);
+    selectedIds.value = JSON.parse(idsStr);
+
+    // 2. Check if we are dragging a selected object
+    // Simple hit test against selected objects
+    const isOverSelected = objects.value
+        .filter(o => selectedIds.value.includes(o.id))
+        .some(o => {
+            return worldPos.x >= o.x && worldPos.x <= o.x + o.width &&
+                   worldPos.y >= o.y && worldPos.y <= o.y + o.height;
+        });
+
+    if (isOverSelected) {
+        // Prepare for dragging
+        initialObjectsState.value.clear();
+        objects.value
+            .filter(o => selectedIds.value.includes(o.id))
+            .forEach(o => {
+                initialObjectsState.value.set(o.id, { x: o.x, y: o.y, width: o.width, height: o.height, rotation: o.rotation });
+            });
+    } else {
+        // Box Select
+        isDragging.value = false;
+        selectionBox.value = { x, y, w: 0, h: 0 };
+    }
+
   } else if (activeTool.value === 'crop') {
     cropState.value = {
         isCropping: true,
@@ -484,6 +688,10 @@ function handleMouseDown(e: MouseEvent) {
     });
     if (res.id) {
         engine.value.execute_command(JSON.stringify({ action: 'select', params: { id: res.id } }));
+        // Force update state immediately so mousemove can see it
+        const json = engine.value.get_objects_json();
+        objects.value = JSON.parse(json);
+        selectedIds.value = [res.id];
     }
   } else if (activeTool.value === 'star' || activeTool.value === 'poly') {
     const type = activeTool.value === 'star' ? 'Star' : 'Polygon';
@@ -493,6 +701,22 @@ function handleMouseDown(e: MouseEvent) {
     });
     if (res.id) {
         engine.value.execute_command(JSON.stringify({ action: 'select', params: { id: res.id } }));
+        // Force update state immediately
+        const json = engine.value.get_objects_json();
+        objects.value = JSON.parse(json);
+        selectedIds.value = [res.id];
+    }
+  } else if (activeTool.value === 'text') {
+    const res = executeCommand({
+        action: 'add',
+        params: { type: 'Text', x: worldPos.x, y: worldPos.y, width: 200, height: 40, fill: '#000000' }
+    });
+    if (res.id) {
+        engine.value.execute_command(JSON.stringify({ action: 'select', params: { id: res.id } }));
+        // Force update state immediately
+        const json = engine.value.get_objects_json();
+        objects.value = JSON.parse(json);
+        selectedIds.value = [res.id];
     }
   } else if (activeTool.value === 'eyedropper') {
       const ctx = canvas.value.getContext('2d');
@@ -500,15 +724,16 @@ function handleMouseDown(e: MouseEvent) {
           // We need to sample from the ACTUAL canvas pixels
           const pixel = ctx.getImageData(x, y, 1, 1).data;
           const hex = "#" + ((1 << 24) + (pixel[0] << 16) + (pixel[1] << 8) + pixel[2]).toString(16).slice(1);
-          if (selectedId.value !== -1) {
+          if (selectedIds.value.length > 0) {
               updateSelected('fill', hex);
           }
       }
   } else if (activeTool.value === 'magic') {
       // Magic tool selects and asks AI to "do something" with this area
-      engine.value.select_at(x, y);
-      const sid = engine.value.get_selected_id();
-      if (sid !== -1) {
+      engine.value.select_point(x, y, false);
+      const sid = engine.value.get_selected_ids(); // returns JSON string
+      const ids = JSON.parse(sid);
+      if (ids.length > 0) {
           chatInput.value = "Improve this object";
           sendMessage();
       } else {
@@ -524,6 +749,10 @@ function handleMouseMove(e: MouseEvent) {
   const x = e.clientX - rect.left;
   const y = e.clientY - rect.top;
 
+  if (isPanning.value || activeTool.value === 'hand') {
+      canvas.value.style.cursor = isPanning.value ? 'grabbing' : 'grab';
+  }
+
   if (isPanning.value) {
       const dx = x - lastMousePos.value.x;
       const dy = y - lastMousePos.value.y;
@@ -537,7 +766,51 @@ function handleMouseMove(e: MouseEvent) {
       return;
   }
 
+  if (selectionBox.value) {
+      selectionBox.value.w = x - selectionBox.value.x;
+      selectionBox.value.h = y - selectionBox.value.y;
+      needsRender.value = true;
+      lastMousePos.value = { x, y };
+      return;
+  }
+
   const worldPos = screenToWorld(x, y);
+
+  if (activeTool.value === 'pencil') {
+      canvas.value.style.cursor = 'crosshair';
+      if (pencilState.value.isDrawing) {
+          const lastPt = pencilState.value.points[pencilState.value.points.length - 1];
+          const dist = Math.sqrt((worldPos.x - lastPt.x)**2 + (worldPos.y - lastPt.y)**2);
+          
+          if (dist > 3 / viewport.value.zoom) {
+              pencilState.value.points.push({ x: worldPos.x, y: worldPos.y });
+              const d = getPencilPathString(pencilState.value.points, { x: 0, y: 0 });
+              executeCommand({
+                  action: 'update',
+                  params: { 
+                      id: pencilState.value.currentObjId, 
+                      path_data: d,
+                      x: 0, y: 0, width: 0, height: 0
+                  }
+              });
+          }
+          return;
+      }
+  }
+
+  if (activeTool.value === 'eraser' && isDragging.value) {
+      canvas.value.style.cursor = 'crosshair'; // Or an eraser-like cursor
+      const idsStr = engine.value.select_point(x, y, false);
+      const ids = JSON.parse(idsStr);
+      if (ids.length > 0) {
+          executeCommand({ action: 'delete', params: { ids } });
+      }
+      return;
+  }
+
+  if (activeTool.value === 'zoom') {
+      canvas.value.style.cursor = e.altKey ? 'zoom-out' : 'zoom-in';
+  }
 
   if (activeTool.value === 'bezier') {
       canvas.value.style.cursor = 'crosshair';
@@ -552,7 +825,104 @@ function handleMouseMove(e: MouseEvent) {
       canvas.value.style.cursor = 'default';
   }
   
-  if (!isDragging.value && !cropState.value.isCropping) return;
+  if (!isDragging.value && !cropState.value.isCropping && !activeHandle.value) return;
+  
+  if (activeHandle.value && selectedObject.value) {
+      const initial = initialObjectsState.value.get(activeHandle.value.id);
+      if (!initial) return;
+
+      const worldPos = screenToWorld(x, y);
+      
+      if (activeHandle.value.type === 'Rotate') {
+          const centerX = initial.x + initial.width / 2;
+          const centerY = initial.y + initial.height / 2;
+          const startWorld = screenToWorld(dragStart.value.x, dragStart.value.y);
+          const startAngle = Math.atan2(startWorld.y - centerY, startWorld.x - centerX);
+          const currentAngle = Math.atan2(worldPos.y - centerY, worldPos.x - centerX);
+          updateSelected('rotation', initial.rotation + (currentAngle - startAngle), false);
+      } else {
+          // Resizing logic: Keep opposite side fixed
+          const type = activeHandle.value.type;
+          
+          // 1. Get mouse position in object's local space (relative to its INITIAL top-left)
+          const dx = worldPos.x - initial.x;
+          const dy = worldPos.y - initial.y;
+          const cos_r = Math.cos(-initial.rotation);
+          const sin_r = Math.sin(-initial.rotation);
+          
+          // Local mouse position relative to initial top-left
+          let lx = dx * cos_r - dy * sin_r;
+          let ly = dx * sin_r + dy * cos_r;
+
+          let newWidth = initial.width;
+          let newHeight = initial.height;
+          let localPivotX = 0;
+          let localPivotY = 0;
+
+          if (type.includes('Right')) {
+              newWidth = lx;
+              localPivotX = 0;
+          } else if (type.includes('Left')) {
+              newWidth = initial.width - lx;
+              localPivotX = initial.width;
+          }
+
+          if (type.includes('Bottom')) {
+              newHeight = ly;
+              localPivotY = 0;
+          } else if (type.includes('Top')) {
+              newHeight = initial.height - ly;
+              localPivotY = initial.height;
+          }
+
+          const isCorner = ['TopLeft', 'TopRight', 'BottomLeft', 'BottomRight'].includes(type);
+          if (isCorner) {
+              const ratio = initial.width / initial.height;
+              if (newWidth / ratio > newHeight) {
+                  newHeight = newWidth / ratio;
+              } else {
+                  newWidth = newHeight * ratio;
+              }
+              
+              // Re-adjust lx/ly based on aspect ratio constraint if we moved Left or Top
+              if (type.includes('Left')) lx = initial.width - newWidth;
+              if (type.includes('Top')) ly = initial.height - newHeight;
+          }
+
+          newWidth = Math.max(1, newWidth);
+          newHeight = Math.max(1, newHeight);
+
+          // 2. Calculate the world position of the pivot (the point that stays fixed)
+          const cos_ir = Math.cos(initial.rotation);
+          const sin_ir = Math.sin(initial.rotation);
+          const pivotWorldX = initial.x + (localPivotX * cos_ir - localPivotY * sin_ir);
+          const pivotWorldY = initial.y + (localPivotX * sin_ir + localPivotY * cos_ir);
+
+          // 3. The new top-left is pivotWorld minus the new local pivot position rotated
+          // New local pivot depends on which handle we are dragging
+          let newLocalPivotX = 0;
+          let newLocalPivotY = 0;
+          if (type.includes('Left')) newLocalPivotX = newWidth;
+          if (type.includes('Top')) newLocalPivotY = newHeight;
+
+          const newX = pivotWorldX - (newLocalPivotX * cos_ir - newLocalPivotY * sin_ir);
+          const newY = pivotWorldY - (newLocalPivotX * sin_ir + newLocalPivotY * cos_ir);
+
+          executeCommand({
+              action: 'update',
+              params: {
+                  id: activeHandle.value.id,
+                  x: newX,
+                  y: newY,
+                  width: newWidth,
+                  height: newHeight,
+                  save_undo: false
+              }
+          });
+      }
+      needsRender.value = true;
+      return;
+  }
   
   if (activeTool.value === 'crop' && cropState.value.isCropping) {
     cropState.value.currentX = worldPos.x;
@@ -562,58 +932,86 @@ function handleMouseMove(e: MouseEvent) {
   }
 
   if (activeTool.value === 'bezier' && bezierState.value.isDrawing) {
-      const idx = bezierState.value.points.length - 1;
-      if (idx >= 0) {
-          const pt = bezierState.value.points[idx];
-          
-          let targetX = worldPos.x;
-          let targetY = worldPos.y;
-          bezierState.value.isSnapped = false;
+      const pts = bezierState.value.points;
+      
+      // 1. Update mouse preview point
+      let targetX = worldPos.x;
+      let targetY = worldPos.y;
+      bezierState.value.isSnapped = false;
 
-          // Snap Logic
-          if (snapMode.value && bezierState.value.points.length > 2) {
-              const startPt = bezierState.value.points[0];
-              const dist = Math.sqrt((worldPos.x - startPt.x)**2 + (worldPos.y - startPt.y)**2);
-              if (dist < 15 / viewport.value.zoom) { // Snap threshold
-                  targetX = startPt.x;
-                  targetY = startPt.y;
-                  bezierState.value.isSnapped = true;
-              }
+      if (snapMode.value && pts.length > 0) {
+          const startPt = pts[0];
+          const dStart = Math.sqrt((worldPos.x - startPt.x)**2 + (worldPos.y - startPt.y)**2);
+          if (dStart < 15 / viewport.value.zoom) {
+              targetX = startPt.x;
+              targetY = startPt.y;
+              bezierState.value.isSnapped = true;
           }
+      }
+      bezierState.value.mousePoint = { x: targetX, y: targetY };
 
-          pt.x = targetX;
-          pt.y = targetY;
-          pt.cout = { x: targetX, y: targetY };
-          pt.cin = { 
-              x: pt.x - (worldPos.x - pt.x),
-              y: pt.y - (worldPos.y - pt.y) 
-          };
-          
-          if (bezierState.value.isSnapped) {
-               pt.cin = { x: targetX, y: targetY };
-               pt.cout = { x: targetX, y: targetY };
+      // 2. If dragging, adjust handles
+      if (isDragging.value && pts.length > 0) {
+          const pt = bezierState.value.isClosing ? pts[0] : pts[pts.length - 1];
+          const dist = Math.sqrt((worldPos.x - pt.x)**2 + (worldPos.y - pt.y)**2);
+          if (dist > 2 / viewport.value.zoom) {
+              pt.cout = { x: worldPos.x, y: worldPos.y };
+              pt.cin = { 
+                  x: pt.x - (worldPos.x - pt.x),
+                  y: pt.y - (worldPos.y - pt.y) 
+              };
           }
+      }
 
-          const d = getPathString(bezierState.value.points);
-          executeCommand({
-                action: 'update',
-                params: { id: bezierState.value.currentObjId, path_data: d }
-            });
+      // 3. Update the path data in world space (0,0)
+      const d = getPathString(pts, bezierState.value.isClosing, bezierState.value.mousePoint, { x: 0, y: 0 });
+      executeCommand({
+            action: 'update',
+            params: { 
+                id: bezierState.value.currentObjId, 
+                path_data: d,
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0
+            }
+        });
+      return;
+  }
+
+  if (activeTool.value === 'rotate' && isDragging.value && selectedObject.value) {
+      const centerX = selectedObject.value.x + selectedObject.value.width / 2;
+      const centerY = selectedObject.value.y + selectedObject.value.height / 2;
+      
+      const startWorld = screenToWorld(dragStart.value.x, dragStart.value.y);
+      const startAngle = Math.atan2(startWorld.y - centerY, startWorld.x - centerX);
+      const currentAngle = Math.atan2(worldPos.y - centerY, worldPos.x - centerX);
+      
+      const deltaAngle = currentAngle - startAngle;
+      const initial = initialObjectsState.value.get(selectedObject.value.id);
+      if (initial) {
+          updateSelected('rotation', initial.rotation + deltaAngle, false);
       }
       return;
   }
 
-  if (activeTool.value === 'select' && selectedObject.value && initialObjectState.value) {
+  if (activeTool.value === 'select' && isDragging.value && selectedIds.value.length > 0) {
     const startWorld = screenToWorld(dragStart.value.x, dragStart.value.y);
     const dx = worldPos.x - startWorld.x;
     const dy = worldPos.y - startWorld.y;
 
-    executeCommand({
-        action: 'update',
-        params: { 
-            id: selectedObject.value.id, 
-            x: initialObjectState.value.x + dx, 
-            y: initialObjectState.value.y + dy 
+    selectedIds.value.forEach(id => {
+        const init = initialObjectsState.value.get(id);
+        if (init) {
+             executeCommand({
+                action: 'update',
+                params: { 
+                    id, 
+                    x: init.x + dx, 
+                    y: init.y + dy,
+                    save_undo: false
+                }
+            });
         }
     });
   } else if (['rect', 'circle', 'star', 'poly'].includes(activeTool.value) && selectedObject.value) {
@@ -629,10 +1027,20 @@ function handleMouseMove(e: MouseEvent) {
   lastMousePos.value = { x, y };
 }
 
-function handleMouseUp() {
+function handleMouseUp(e: MouseEvent) {
   if (isPanning.value) {
       isPanning.value = false;
       if (canvas.value) canvas.value.style.cursor = isSpacePressed.value ? 'grab' : 'default';
+  }
+
+  if (selectionBox.value) {
+      const { x, y, w, h } = selectionBox.value;
+      if (Math.abs(w) > 2 && Math.abs(h) > 2) {
+          const idsStr = engine.value?.select_rect(x, y, w, h, e.shiftKey || e.metaKey);
+          if (idsStr) selectedIds.value = JSON.parse(idsStr);
+      }
+      selectionBox.value = null;
+      // We don't return here because we might need to reset tools or other cleanup
   }
 
   if (activeTool.value === 'crop' && cropState.value.isCropping) {
@@ -715,16 +1123,92 @@ function handleMouseUp() {
       activeTool.value = 'select';
   }
 
-  if (activeTool.value === 'select' && isDragging.value && selectedObject.value) {
-      // Create undo point at the end of dragging
+  if (activeHandle.value) {
       executeCommand({
           action: 'update',
-          params: { id: selectedObject.value.id, save_undo: true }
+          params: { id: activeHandle.value.id, save_undo: true }
+      });
+      activeHandle.value = null;
+  }
+
+  if (activeTool.value === 'select' && isDragging.value && selectedIds.value.length > 0) {
+      // Create undo point at the end of dragging
+      // We trigger a save_undo by updating the first selected object with no changes (or just save_undo flag)
+      executeCommand({
+          action: 'update',
+          params: { id: selectedIds.value[0], save_undo: true }
       });
   }
 
+  if (activeTool.value === 'bezier' && bezierState.value.isDrawing && bezierState.value.isClosing) {
+      // Finalize the closed path
+      const pts = bezierState.value.points;
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      pts.forEach(p => {
+          minX = Math.min(minX, p.x, p.cin.x, p.cout.x);
+          minY = Math.min(minY, p.y, p.cin.y, p.cout.y);
+          maxX = Math.max(maxX, p.x, p.cin.x, p.cout.x);
+          maxY = Math.max(maxY, p.y, p.cin.y, p.cout.y);
+      });
+
+      const newD = getPathString(pts, true, null, { x: minX, y: minY });
+      executeCommand({
+          action: 'update',
+          params: {
+              id: bezierState.value.currentObjId,
+              path_data: newD,
+              x: minX,
+              y: minY,
+              width: Math.max(1, maxX - minX),
+              height: Math.max(1, maxY - minY),
+              save_undo: true
+          }
+      });
+      
+      bezierState.value.isDrawing = false;
+      bezierState.value.isClosing = false;
+      bezierState.value.points = [];
+      bezierState.value.mousePoint = null;
+      activeTool.value = 'select';
+  }
+
+  if (activeTool.value === 'pencil' && pencilState.value.isDrawing) {
+      const pts = pencilState.value.points;
+      if (pts.length > 1) {
+          let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+          pts.forEach(p => {
+              minX = Math.min(minX, p.x);
+              minY = Math.min(minY, p.y);
+              maxX = Math.max(maxX, p.x);
+              maxY = Math.max(maxY, p.y);
+          });
+
+          const d = getPencilPathString(pts, { x: minX, y: minY });
+          executeCommand({
+              action: 'update',
+              params: {
+                  id: pencilState.value.currentObjId,
+                  path_data: d,
+                  x: minX,
+                  y: minY,
+                  width: Math.max(1, maxX - minX),
+                  height: Math.max(1, maxY - minY),
+                  save_undo: true
+              }
+          });
+      } else {
+          // Delete if only one point
+          executeCommand({ action: 'delete', params: { id: pencilState.value.currentObjId } });
+      }
+      pencilState.value.isDrawing = false;
+      pencilState.value.points = [];
+      activeTool.value = 'select';
+  }
+
   isDragging.value = false;
-  if (!['select', 'bezier'].includes(activeTool.value)) {
+  initialObjectsState.value.clear();
+  
+  if (!['select', 'bezier', 'pencil', 'eraser', 'hand', 'zoom', 'rotate'].includes(activeTool.value)) {
       activeTool.value = 'select';
   }
 }
@@ -763,17 +1247,63 @@ async function sendMessage() {
   }
 }
 
+function initGradient(prop: 'fill' | 'stroke') {
+    if (selectedIds.value.length === 0) return;
+    const defaultGradient = {
+        is_radial: false,
+        x1: 0, y1: 0, x2: 100, y2: 0,
+        r1: 0, r2: 50,
+        stops: [
+            { offset: 0, color: '#ffffff' },
+            { offset: 1, color: '#000000' }
+        ]
+    };
+    updateSelected(prop + '_gradient', defaultGradient);
+}
+
+function updateGradient(prop: 'fill' | 'stroke', key: string, value: any) {
+    if (!selectedObject.value) return;
+    const grad = { ...selectedObject.value[prop + '_gradient'] };
+    grad[key] = value;
+    updateSelected(prop + '_gradient', grad);
+}
+
+function updateGradientStop(prop: 'fill' | 'stroke', idx: number, key: string, value: any) {
+    if (!selectedObject.value) return;
+    const grad = { ...selectedObject.value[prop + '_gradient'] };
+    const stops = [...grad.stops];
+    stops[idx] = { ...stops[idx], [key]: value };
+    grad.stops = stops;
+    updateSelected(prop + '_gradient', grad);
+}
+
+function addGradientStop(prop: 'fill' | 'stroke') {
+    if (!selectedObject.value) return;
+    const grad = { ...selectedObject.value[prop + '_gradient'] };
+    grad.stops.push({ offset: 0.5, color: '#888888' });
+    grad.stops.sort((a: any, b: any) => a.offset - b.offset);
+    updateSelected(prop + '_gradient', grad);
+}
+
+function removeGradientStop(prop: 'fill' | 'stroke', idx: number) {
+    if (!selectedObject.value) return;
+    const grad = { ...selectedObject.value[prop + '_gradient'] };
+    if (grad.stops.length <= 2) return; // Min 2 stops
+    grad.stops.splice(idx, 1);
+    updateSelected(prop + '_gradient', grad);
+}
+
 function updateSelected(key: string, value: any, saveUndo: boolean = true) {
-    if (selectedId.value === -1) return;
+    if (selectedIds.value.length === 0) return;
     executeCommand({
         action: 'update',
-        params: { id: selectedId.value, [key]: value, save_undo: saveUndo }
+        params: { ids: selectedIds.value, [key]: value, save_undo: saveUndo }
     });
 }
 
 function deleteSelected() {
-    if (selectedId.value === -1) return;
-    executeCommand({ action: 'delete', params: { id: selectedId.value } });
+    if (selectedIds.value.length === 0) return;
+    executeCommand({ action: 'delete', params: { ids: selectedIds.value } });
 }
 
 function undo() {
@@ -800,7 +1330,7 @@ function handleOpenImage(event: Event) {
         // Clear all existing objects for a new document
         executeCommand({ action: 'clear', params: {} });
         objects.value = [];
-        selectedId.value = -1;
+        selectedIds.value = [];
 
         // Resize artboard to image size
         artboard.value.width = img.width;
@@ -1016,48 +1546,63 @@ function handleFileUpload(event: Event) {
       <!-- Left Toolbar -->
       <aside class="toolbar-side">
         <button :class="{ active: activeTool === 'select' }" @click="activeTool = 'select'" title="Select (V)">
-          <span class="icon">↗</span>
+          <MousePointer2 :size="18" />
         </button>
 
         <div class="tool-group" @mouseenter="showShapesMenu = true" @mouseleave="showShapesMenu = false">
             <button :class="{ active: ['rect', 'circle', 'star', 'poly'].includes(activeTool) }" title="Shapes">
-                <span class="icon">{{ 
-                    activeTool === 'circle' ? '○' : 
-                    activeTool === 'star' ? '★' : 
-                    activeTool === 'poly' ? '⬢' : '▢' 
-                }}</span>
+                <component :is="activeTool === 'circle' ? Circle : activeTool === 'star' ? Star : activeTool === 'poly' ? Hexagon : Square" :size="18" />
             </button>
             <div v-if="showShapesMenu" class="tool-flyout">
-                <button :class="{ active: activeTool === 'rect' }" @click="activeTool = 'rect'" title="Rectangle (R)">
-                    <span class="icon">▢</span>
+                <button :class="{ active: activeTool === 'rect' }" @click="activeTool = 'rect'" title="Rectangle (M)">
+                    <Square :size="18" />
                 </button>
                 <button :class="{ active: activeTool === 'circle' }" @click="activeTool = 'circle'" title="Circle (O)">
-                    <span class="icon">○</span>
+                    <Circle :size="18" />
                 </button>
                 <button :class="{ active: activeTool === 'star' }" @click="activeTool = 'star'" title="Star (S)">
-                    <span class="icon">★</span>
+                    <Star :size="18" />
                 </button>
                 <button :class="{ active: activeTool === 'poly' }" @click="activeTool = 'poly'" title="Polygon (G)">
-                    <span class="icon">⬢</span>
+                    <Hexagon :size="18" />
                 </button>
             </div>
         </div>
 
+        <button :class="{ active: activeTool === 'rotate' }" @click="activeTool = 'rotate'" title="Rotate Tool (R)">
+          <RotateCw :size="18" />
+        </button>
+
         <button :class="{ active: activeTool === 'bezier' }" @click="activeTool = 'bezier'" title="Bezier Pen (P)">
-          <span class="icon">✒</span>
+          <PenTool :size="18" />
+        </button>
+        <button :class="{ active: activeTool === 'pencil' }" @click="activeTool = 'pencil'" title="Pencil (N)">
+          <Pencil :size="18" />
+        </button>
+        <button :class="{ active: activeTool === 'eraser' }" @click="activeTool = 'eraser'" title="Eraser (E)">
+          <Eraser :size="18" />
+        </button>
+        <button :class="{ active: activeTool === 'text' }" @click="activeTool = 'text'" title="Text Tool (T)">
+          <Type :size="18" />
         </button>
         <button :class="{ active: activeTool === 'eyedropper' }" @click="activeTool = 'eyedropper'" title="Eyedropper (I)">
-          <span class="icon">💧</span>
+          <Pipette :size="18" />
         </button>
         <button :class="{ active: activeTool === 'magic' }" @click="activeTool = 'magic'" title="Magic AI (M)">
-          <span class="icon">✨</span>
+          <Wand2 :size="18" />
         </button>
         <button :class="{ active: activeTool === 'crop' }" @click="activeTool = 'crop'" title="Crop Artboard (C)">
-          <span class="icon">✂</span>
+          <Crop :size="18" />
+        </button>
+        <button :class="{ active: activeTool === 'hand' }" @click="activeTool = 'hand'" title="Hand Tool (H)">
+          <Hand :size="18" />
+        </button>
+        <button :class="{ active: activeTool === 'zoom' }" @click="activeTool = 'zoom'" title="Zoom Tool (Z)">
+          <Search :size="18" />
         </button>
         <div class="separator"></div>
         <button @click="fileInput?.click()" title="Import Image or Document">
-          <span class="icon">🖼</span>
+          <Upload :size="18" />
         </button>
         <input type="file" @change="handleFileUpload" accept="image/*,.ai,.psd" ref="fileInput" style="display: none" />
         <input type="file" @change="handleOpenImage" accept="image/*" ref="openImageInput" style="display: none" />
@@ -1071,7 +1616,7 @@ function handleFileUpload(event: Event) {
           @mousemove="handleMouseMove"
           @mouseup="handleMouseUp"
           @mouseleave="handleMouseUp"
-          @wheel="handleWheel"
+          @wheel.prevent="handleWheel"
         ></canvas>
 
         <!-- AI Processing Overlay -->
@@ -1094,7 +1639,8 @@ function handleFileUpload(event: Event) {
         <!-- Top Section: Properties or Layers -->
         <div class="side-panels-top">
           <section v-if="selectedObject" class="panel properties-panel">
-            <h3>Properties</h3>
+            <!-- ... existing selectedObject panel ... -->
+            <h3>Properties {{ selectedIds.length > 1 ? `(${selectedIds.length})` : '' }}</h3>
             <div class="property-grid">
               <label>Name</label>
               <input :value="selectedObject.name" @input="e => updateSelected('name', (e.target as HTMLInputElement).value)" />
@@ -1111,10 +1657,42 @@ function handleFileUpload(event: Event) {
               <label>Height</label>
               <input type="number" :value="Math.round(selectedObject.height)" @input="e => updateSelected('height', Number((e.target as HTMLInputElement).value))" />
               
+              <label>Rotation</label>
+              <input type="number" :value="Math.round(selectedObject.rotation * 180 / Math.PI)" @input="e => updateSelected('rotation', Number((e.target as HTMLInputElement).value) * Math.PI / 180)" />
+
               <label>Fill</label>
-              <div class="color-picker">
-                  <input type="color" :value="safeColor(selectedObject.fill)" @input="e => updateSelected('fill', (e.target as HTMLInputElement).value)" />
-                  <input type="text" :value="selectedObject.fill" @input="e => updateSelected('fill', (e.target as HTMLInputElement).value)" />
+              <div class="fill-control">
+                  <div class="fill-type-toggle">
+                      <button :class="{ active: !selectedObject.fill_gradient }" @click="updateSelected('fill_gradient', null)">Solid</button>
+                      <button :class="{ active: !!selectedObject.fill_gradient }" @click="initGradient('fill')">Gradient</button>
+                  </div>
+                  
+                  <div v-if="!selectedObject.fill_gradient" class="color-picker">
+                      <input type="color" :value="safeColor(selectedObject.fill)" @input="e => updateSelected('fill', (e.target as HTMLInputElement).value)" />
+                      <input type="text" :value="selectedObject.fill" @input="e => updateSelected('fill', (e.target as HTMLInputElement).value)" />
+                  </div>
+                  
+                  <div v-else class="gradient-editor">
+                      <select :value="selectedObject.fill_gradient.is_radial ? 'radial' : 'linear'" 
+                              @change="e => updateGradient('fill', 'is_radial', (e.target as HTMLSelectElement).value === 'radial')">
+                          <option value="linear">Linear</option>
+                          <option value="radial">Radial</option>
+                      </select>
+                      <div class="stops-list">
+                          <div v-for="(stop, idx) in selectedObject.fill_gradient.stops" :key="idx" class="stop-item">
+                              <input type="color" :value="stop.color" @input="e => updateGradientStop('fill', idx, 'color', (e.target as HTMLInputElement).value)" />
+                              <input type="number" min="0" max="1" step="0.1" :value="stop.offset" @input="e => updateGradientStop('fill', idx, 'offset', Number((e.target as HTMLInputElement).value))" />
+                              <button @click="removeGradientStop('fill', idx)">×</button>
+                          </div>
+                          <button @click="addGradientStop('fill')">+ Stop</button>
+                      </div>
+                      <div class="coords-editor">
+                          <label>x1 <input type="number" :value="selectedObject.fill_gradient.x1" @input="e => updateGradient('fill', 'x1', Number((e.target as HTMLInputElement).value))" /></label>
+                          <label>y1 <input type="number" :value="selectedObject.fill_gradient.y1" @input="e => updateGradient('fill', 'y1', Number((e.target as HTMLInputElement).value))" /></label>
+                          <label>x2 <input type="number" :value="selectedObject.fill_gradient.x2" @input="e => updateGradient('fill', 'x2', Number((e.target as HTMLInputElement).value))" /></label>
+                          <label>y2 <input type="number" :value="selectedObject.fill_gradient.y2" @input="e => updateGradient('fill', 'y2', Number((e.target as HTMLInputElement).value))" /></label>
+                      </div>
+                  </div>
               </div>
 
               <label>Stroke</label>
@@ -1133,10 +1711,73 @@ function handleFileUpload(event: Event) {
                   @input="e => updateSelected('opacity', Number((e.target as HTMLInputElement).value), false)"
                   @change="e => updateSelected('opacity', Number((e.target as HTMLInputElement).value), true)"
               />
+
+              <label>Blend</label>
+              <select :value="selectedObject.blend_mode" @change="e => updateSelected('blend_mode', (e.target as HTMLSelectElement).value)">
+                  <option value="source-over">Normal</option>
+                  <option value="multiply">Multiply</option>
+                  <option value="screen">Screen</option>
+                  <option value="overlay">Overlay</option>
+                  <option value="darken">Darken</option>
+                  <option value="lighten">Lighten</option>
+                  <option value="color-dodge">Color Dodge</option>
+                  <option value="color-burn">Color Burn</option>
+                  <option value="hard-light">Hard Light</option>
+                  <option value="soft-light">Soft Light</option>
+                  <option value="difference">Difference</option>
+                  <option value="exclusion">Exclusion</option>
+                  <option value="hue">Hue</option>
+                  <option value="saturation">Saturation</option>
+                  <option value="color">Color</option>
+                  <option value="luminosity">Luminosity</option>
+              </select>
+
+              <div class="separator-text">STROKE STYLE</div>
+
+              <label>Cap</label>
+              <select :value="selectedObject.stroke_cap" @change="e => updateSelected('stroke_cap', (e.target as HTMLSelectElement).value)">
+                  <option value="butt">Butt</option>
+                  <option value="round">Round</option>
+                  <option value="square">Square</option>
+              </select>
+
+              <label>Join</label>
+              <select :value="selectedObject.stroke_join" @change="e => updateSelected('stroke_join', (e.target as HTMLSelectElement).value)">
+                  <option value="miter">Miter</option>
+                  <option value="round">Round</option>
+                  <option value="bevel">Bevel</option>
+              </select>
+
+              <label>Dash</label>
+              <input type="text" :value="selectedObject.stroke_dash.join(',')" 
+                     @input="e => updateSelected('stroke_dash', (e.target as HTMLInputElement).value.split(',').map(Number).filter(n => !isNaN(n)))" 
+                     placeholder="e.g. 5,5" />
+
+              <div class="separator-text">SHADOW</div>
+              
+              <label>Color</label>
+              <div class="color-picker">
+                  <input type="color" :value="safeColor(selectedObject.shadow_color)" @input="e => updateSelected('shadow_color', (e.target as HTMLInputElement).value)" />
+                  <input type="text" :value="selectedObject.shadow_color" @input="e => updateSelected('shadow_color', (e.target as HTMLInputElement).value)" />
+              </div>
+
+              <label>Blur</label>
+              <input type="number" :value="selectedObject.shadow_blur" @input="e => updateSelected('shadow_blur', Number((e.target as HTMLInputElement).value))" />
+
+              <label>Offset X</label>
+              <input type="number" :value="selectedObject.shadow_offset_x" @input="e => updateSelected('shadow_offset_x', Number((e.target as HTMLInputElement).value))" />
+
+              <label>Offset Y</label>
+              <input type="number" :value="selectedObject.shadow_offset_y" @input="e => updateSelected('shadow_offset_y', Number((e.target as HTMLInputElement).value))" />
               
               <template v-if="selectedObject.shape_type === 'Star' || selectedObject.shape_type === 'Polygon'">
                   <label>Sides</label>
                   <input type="number" :value="selectedObject.sides" @input="e => updateSelected('sides', Number((e.target as HTMLInputElement).value))" />
+              </template>
+
+              <template v-if="selectedObject.shape_type === 'Rectangle'">
+                  <label>Corners</label>
+                  <input type="range" min="0" max="100" step="1" :value="selectedObject.corner_radius" @input="e => updateSelected('corner_radius', Number((e.target as HTMLInputElement).value))" />
               </template>
 
               <template v-if="selectedObject.shape_type === 'Star'">
@@ -1144,7 +1785,62 @@ function handleFileUpload(event: Event) {
                   <input type="range" min="0" max="1" step="0.05" :value="selectedObject.inner_radius" @input="e => updateSelected('inner_radius', Number((e.target as HTMLInputElement).value))" />
               </template>
 
+              <template v-if="selectedObject.shape_type === 'Text'">
+                  <div class="separator-text">TEXT</div>
+                  
+                  <label>Content</label>
+                  <textarea :value="selectedObject.text_content" @input="e => updateSelected('text_content', (e.target as HTMLTextAreaElement).value)" rows="3" class="text-area-input"></textarea>
+
+                  <label>Font</label>
+                  <input :value="selectedObject.font_family" @input="e => updateSelected('font_family', (e.target as HTMLInputElement).value)" />
+
+                  <label>Size</label>
+                  <input type="number" :value="selectedObject.font_size" @input="e => updateSelected('font_size', Number((e.target as HTMLInputElement).value))" />
+
+                  <label>Weight</label>
+                  <select :value="selectedObject.font_weight" @change="e => updateSelected('font_weight', (e.target as HTMLSelectElement).value)">
+                      <option value="normal">Normal</option>
+                      <option value="bold">Bold</option>
+                      <option value="300">Light</option>
+                      <option value="900">Black</option>
+                  </select>
+
+                  <label>Align</label>
+                  <select :value="selectedObject.text_align" @change="e => updateSelected('text_align', (e.target as HTMLSelectElement).value)">
+                      <option value="left">Left</option>
+                      <option value="center">Center</option>
+                      <option value="right">Right</option>
+                  </select>
+              </template>
+
               <template v-if="selectedObject.shape_type === 'Image'">
+                  <div class="separator-text">FILTERS</div>
+                  
+                  <label>Brightness</label>
+                  <input type="range" min="0" max="3" step="0.1" :value="selectedObject.brightness" 
+                         @input="e => updateSelected('brightness', Number((e.target as HTMLInputElement).value), false)"
+                         @change="e => updateSelected('brightness', Number((e.target as HTMLInputElement).value), true)" />
+
+                  <label>Contrast</label>
+                  <input type="range" min="0" max="3" step="0.1" :value="selectedObject.contrast" 
+                         @input="e => updateSelected('contrast', Number((e.target as HTMLInputElement).value), false)"
+                         @change="e => updateSelected('contrast', Number((e.target as HTMLInputElement).value), true)" />
+
+                  <label>Saturation</label>
+                  <input type="range" min="0" max="3" step="0.1" :value="selectedObject.saturate" 
+                         @input="e => updateSelected('saturate', Number((e.target as HTMLInputElement).value), false)"
+                         @change="e => updateSelected('saturate', Number((e.target as HTMLInputElement).value), true)" />
+
+                  <label>Hue Rotate</label>
+                  <input type="range" min="0" max="360" step="1" :value="selectedObject.hue_rotate" 
+                         @input="e => updateSelected('hue_rotate', Number((e.target as HTMLInputElement).value), false)"
+                         @change="e => updateSelected('hue_rotate', Number((e.target as HTMLInputElement).value), true)" />
+
+                  <label>Blur</label>
+                  <input type="range" min="0" max="20" step="0.5" :value="selectedObject.blur" 
+                         @input="e => updateSelected('blur', Number((e.target as HTMLInputElement).value), false)"
+                         @change="e => updateSelected('blur', Number((e.target as HTMLInputElement).value), true)" />
+
                   <div class="actions">
                       <button class="ai-bg-btn-large" @click="removeSelectedBackground">✨ Remove Background (AI)</button>
                   </div>
@@ -1153,41 +1849,87 @@ function handleFileUpload(event: Event) {
               <label>Locked</label>
               <input type="checkbox" :checked="selectedObject.locked" @change="e => updateSelected('locked', (e.target as HTMLInputElement).checked)" />
 
-              <div class="actions">
-                  <button class="delete-btn" @click="deleteSelected">Delete Object</button>
+              <div class="separator-text">ARRANGE</div>
+              <div class="arrange-btns">
+                  <button @click="executeCommand({ action: 'move_to_front', params: { id: selectedObject.id } })" title="Bring to Front">
+                      <BringToFront :size="16" />
+                  </button>
+                  <button @click="executeCommand({ action: 'move_forward', params: { id: selectedObject.id } })" title="Bring Forward">
+                      <ChevronUp :size="16" />
+                  </button>
+                  <button @click="executeCommand({ action: 'move_backward', params: { id: selectedObject.id } })" title="Send Backward">
+                      <ChevronDown :size="16" />
+                  </button>
+                  <button @click="executeCommand({ action: 'move_to_back', params: { id: selectedObject.id } })" title="Send to Back">
+                      <SendToBack :size="16" />
+                  </button>
               </div>
+
+              <div class="actions">
+                  <button class="duplicate-btn" @click="executeCommand({ action: 'duplicate', params: { id: selectedObject.id } })">
+                    <Copy :size="14" style="margin-right: 6px; vertical-align: middle;" /> Duplicate Object
+                  </button>
+                  <button class="delete-btn" @click="deleteSelected">
+                    <Trash2 :size="14" style="margin-right: 6px; vertical-align: middle;" /> Delete Object
+                  </button>
+              </div>
+            </div>
+          </section>
+
+          <section v-else-if="targetImageId !== -1" class="panel filters-panel">
+            <h3>Image Adjustments (BG)</h3>
+            <div class="property-grid">
+                <label>Brightness</label>
+                <input type="range" min="0" max="3" step="0.1" 
+                       :value="objects.find(o => o.id === targetImageId)?.brightness" 
+                       @input="e => executeCommand({ action: 'update', params: { id: targetImageId, brightness: Number((e.target as HTMLInputElement).value) } })"
+                       @change="e => executeCommand({ action: 'update', params: { id: targetImageId, brightness: Number((e.target as HTMLInputElement).value), save_undo: true } })" />
+
+                <label>Contrast</label>
+                <input type="range" min="0" max="3" step="0.1" 
+                       :value="objects.find(o => o.id === targetImageId)?.contrast" 
+                       @input="e => executeCommand({ action: 'update', params: { id: targetImageId, contrast: Number((e.target as HTMLInputElement).value) } })"
+                       @change="e => executeCommand({ action: 'update', params: { id: targetImageId, contrast: Number((e.target as HTMLInputElement).value), save_undo: true } })" />
+
+                <label>Saturation</label>
+                <input type="range" min="0" max="3" step="0.1" 
+                       :value="objects.find(o => o.id === targetImageId)?.saturate" 
+                       @input="e => executeCommand({ action: 'update', params: { id: targetImageId, saturate: Number((e.target as HTMLInputElement).value) } })"
+                       @change="e => executeCommand({ action: 'update', params: { id: targetImageId, saturate: Number((e.target as HTMLInputElement).value), save_undo: true } })" />
+                
+                <label>Blur</label>
+                <input type="range" min="0" max="20" step="0.5" 
+                       :value="objects.find(o => o.id === targetImageId)?.blur" 
+                       @input="e => executeCommand({ action: 'update', params: { id: targetImageId, blur: Number((e.target as HTMLInputElement).value) } })"
+                       @change="e => executeCommand({ action: 'update', params: { id: targetImageId, blur: Number((e.target as HTMLInputElement).value), save_undo: true } })" />
             </div>
           </section>
 
           <section v-else class="panel layers-panel">
             <h3>Layers</h3>
             <div class="layers-list">
-              <div 
+              <LayerItem 
                 v-for="obj in [...objects].reverse()" 
                 :key="obj.id" 
-                :class="['layer-item', { selected: obj.id === selectedId }]"
-                @click="engine?.execute_command(JSON.stringify({ action: 'select', params: { id: obj.id } }))"
-              >
-                <span class="layer-icon">
-                    {{ 
-                        obj.shape_type === 'Rectangle' ? '▢' : 
-                        obj.shape_type === 'Circle' ? '○' : 
-                        obj.shape_type === 'Ellipse' ? '⬭' : 
-                        obj.shape_type === 'Star' ? '★' : 
-                        obj.shape_type === 'Polygon' ? '⬢' : 
-                        obj.shape_type === 'Image' ? '🖼' : 
-                        obj.shape_type === 'Path' ? '✒' : '?' 
-                    }}
-                </span>
-                <span class="layer-name">{{ obj.name }}</span>
-                <button 
-                  class="lock-toggle" 
-                  @click.stop="executeCommand({ action: 'update', params: { id: obj.id, locked: !obj.locked } })"
-                  title="Toggle Lock"
-                >
-                  {{ obj.locked ? '🔒' : '🔓' }}
-                </button>
-              </div>
+                :obj="obj"
+                :selectedIds="selectedIds"
+                @select="(id, e) => {
+                    if (e.shiftKey || e.metaKey) {
+                        const idx = selectedIds.indexOf(id);
+                        const newIds = [...selectedIds];
+                        if (idx >= 0) {
+                            newIds.splice(idx, 1);
+                        } else {
+                            newIds.push(id);
+                        }
+                        executeCommand({ action: 'select', params: { ids: newIds } });
+                    } else {
+                        executeCommand({ action: 'select', params: { id } });
+                    }
+                }"
+                @toggle-visible="(id, v) => executeCommand({ action: 'update', params: { id, visible: v } })"
+                @toggle-lock="(id, l) => executeCommand({ action: 'update', params: { id, locked: l } })"
+              />
             </div>
           </section>
         </div>
@@ -1614,12 +2356,30 @@ canvas {
   align-items: center;
 }
 
-.property-grid input {
+.property-grid input, .property-grid select, .property-grid textarea {
   background: #1a1a1a;
   border: 1px solid #333;
   color: #eee;
   padding: 4px 8px;
   border-radius: 4px;
+  font-family: inherit;
+  font-size: 12px;
+}
+
+.text-area-input {
+    grid-column: span 2;
+    resize: vertical;
+    min-height: 60px;
+}
+
+.separator-text {
+    grid-column: span 2;
+    font-size: 9px;
+    font-weight: 800;
+    color: #555;
+    padding: 10px 0 5px 0;
+    border-bottom: 1px solid #333;
+    margin-bottom: 5px;
 }
 
 .color-picker {
@@ -1636,6 +2396,27 @@ canvas {
 .actions {
     grid-column: span 2;
     padding-top: 10px;
+}
+
+.arrange-btns {
+    grid-column: span 2;
+    display: flex;
+    gap: 4px;
+}
+
+.arrange-btns button {
+    flex: 1;
+    background: #333;
+    border: 1px solid #444;
+    color: #eee;
+    padding: 4px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 14px;
+}
+
+.arrange-btns button:hover {
+    background: #444;
 }
 
 .ai-bg-btn {
@@ -1674,6 +2455,21 @@ canvas {
     background: #0088ff;
 }
 
+.duplicate-btn {
+    width: 100%;
+    background: #333;
+    color: #eee;
+    border: 1px solid #444;
+    padding: 6px;
+    border-radius: 4px;
+    cursor: pointer;
+    margin-bottom: 8px;
+}
+
+.duplicate-btn:hover {
+    background: #444;
+}
+
 .delete-btn {
     width: 100%;
     background: #442222;
@@ -1700,6 +2496,21 @@ canvas {
 
 .layer-item:hover { background: #2a2a2a; }
 .layer-item.selected { background: #333; border-left: 2px solid #4facfe; }
+
+.visibility-toggle {
+    background: transparent;
+    border: none;
+    color: #666;
+    cursor: pointer;
+    font-size: 14px;
+    padding: 0;
+    width: 20px;
+    text-align: center;
+}
+
+.visibility-toggle:hover {
+    color: #eee;
+}
 
 .layer-icon { color: #666; font-size: 14px; }
 
@@ -1744,8 +2555,82 @@ canvas {
   border: 1px solid #333;
   color: white;
   padding: 8px 12px;
-  border-radius: 20px;
-  font-size: 12px;
+}
+
+.fill-control {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    width: 100%;
+}
+
+.fill-type-toggle {
+    display: flex;
+    gap: 4px;
+}
+
+.fill-type-toggle button {
+    flex: 1;
+    background: #333;
+    border: 1px solid #444;
+    color: #999;
+    padding: 4px;
+    cursor: pointer;
+    font-size: 10px;
+}
+
+.fill-type-toggle button.active {
+    background: #4facfe;
+    color: white;
+}
+
+.gradient-editor {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    background: #2a2a2a;
+    padding: 8px;
+    border-radius: 4px;
+}
+
+.stops-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.stop-item {
+    display: flex;
+    gap: 4px;
+    align-items: center;
+}
+
+.stop-item input[type="color"] {
+    width: 20px;
+    height: 20px;
+    padding: 0;
+    border: none;
+}
+
+.stop-item input[type="number"] {
+    width: 40px;
+}
+
+.coords-editor {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 4px;
+}
+
+.coords-editor label {
+    display: flex;
+    gap: 4px;
+    align-items: center;
+    font-size: 10px;
+}
+
+.coords-editor input {
+    width: 100%;
 }
 
 .no-selection {

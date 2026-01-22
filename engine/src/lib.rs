@@ -1,6 +1,6 @@
 use wasm_bindgen::prelude::*;
 use serde::{Serialize, Deserialize};
-use web_sys::{HtmlImageElement, Path2d};
+use web_sys::{HtmlImageElement, Path2d, CanvasGradient};
 use psd::Psd;
 use image::{ImageOutputFormat, DynamicImage, RgbaImage};
 use std::io::Cursor;
@@ -18,6 +18,31 @@ pub enum ShapeType {
     Polygon,
     Image,
     Path,
+    Text,
+    Group,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
+pub enum HandleType {
+    TopLeft, TopRight, BottomLeft, BottomRight,
+    Top, Bottom, Left, Right,
+    Rotate,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct GradientStop {
+    pub offset: f64, // 0.0 to 1.0
+    pub color: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Gradient {
+    pub is_radial: bool,
+    pub x1: f64, pub y1: f64, // Start point (or center for radial)
+    pub x2: f64, pub y2: f64, // End point (or radius point for radial)
+    pub r1: f64, // Inner radius (radial only)
+    pub r2: f64, // Outer radius (radial only)
+    pub stops: Vec<GradientStop>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -31,28 +56,47 @@ pub struct VectorObject {
     pub height: f64,
     pub rotation: f64, // in radians
     pub fill: String,
+    pub fill_gradient: Option<Gradient>, // New: Gradient support
     pub stroke: String,
+    pub stroke_gradient: Option<Gradient>, // New: Gradient support
     pub stroke_width: f64,
     pub opacity: f64,
     pub visible: bool,
     pub locked: bool,
-    pub blend_mode: String, // New: CSS blend mode
-    pub stroke_cap: String, // New: "butt", "round", "square"
-    pub stroke_join: String, // New: "miter", "round", "bevel"
-    pub stroke_dash: Vec<f64>, // New: Array of dash lengths
+    pub blend_mode: String,
+    pub stroke_cap: String,
+    pub stroke_join: String,
+    pub stroke_dash: Vec<f64>,
     // Shape specific
-    pub sides: u32,       // For Polygon
-    pub inner_radius: f64, // For Star (0.0 to 1.0 ratio)
-    pub corner_radius: f64, // For Rectangle
-    pub path_data: String, // For Path (SVG d)
+    pub sides: u32,
+    pub inner_radius: f64,
+    pub corner_radius: f64,
+    pub path_data: String,
+    // Text specific
+    pub text_content: String,
+    pub font_family: String,
+    pub font_size: f64,
+    pub font_weight: String,
+    pub text_align: String,
+    pub shadow_color: String,
+    pub shadow_blur: f64,
+    pub shadow_offset_x: f64,
+    pub shadow_offset_y: f64,
     // Source rect for cropping
     pub sx: f64,
     pub sy: f64,
     pub sw: f64,
     pub sh: f64,
-    pub image_data_url: Option<String>, // Base64 data for transport
+    pub brightness: f64,
+    pub contrast: f64,
+    pub saturate: f64,
+    pub hue_rotate: f64,
+    pub blur: f64,
+    pub image_data_url: Option<String>,
     #[serde(skip)]
     pub image: Option<HtmlImageElement>,
+    // Grouping
+    pub children: Option<Vec<VectorObject>>, // New: Grouping support
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -66,7 +110,7 @@ pub struct Artboard {
 struct EngineState {
     objects: Vec<VectorObject>,
     next_id: u32,
-    selected_id: Option<u32>,
+    selected_ids: Vec<u32>,
     artboard: Artboard,
     clip_to_artboard: bool,
 }
@@ -75,7 +119,7 @@ struct EngineState {
 pub struct VectorEngine {
     objects: Vec<VectorObject>,
     next_id: u32,
-    selected_id: Option<u32>,
+    selected_ids: Vec<u32>,
     pub viewport_x: f64,
     pub viewport_y: f64,
     pub viewport_zoom: f64,
@@ -92,7 +136,7 @@ impl VectorEngine {
         VectorEngine {
             objects: Vec::new(),
             next_id: 1,
-            selected_id: None,
+            selected_ids: Vec::new(),
             viewport_x: 0.0,
             viewport_y: 0.0,
             viewport_zoom: 1.0,
@@ -111,7 +155,7 @@ impl VectorEngine {
         let state = EngineState {
             objects: self.objects.clone(),
             next_id: self.next_id,
-            selected_id: self.selected_id,
+            selected_ids: self.selected_ids.clone(),
             artboard: self.artboard.clone(),
             clip_to_artboard: self.clip_to_artboard,
         };
@@ -127,7 +171,7 @@ impl VectorEngine {
             let current_state = EngineState {
                 objects: self.objects.clone(),
                 next_id: self.next_id,
-                selected_id: self.selected_id,
+                selected_ids: self.selected_ids.clone(),
                 artboard: self.artboard.clone(),
                 clip_to_artboard: self.clip_to_artboard,
             };
@@ -135,7 +179,7 @@ impl VectorEngine {
 
             self.objects = prev_state.objects;
             self.next_id = prev_state.next_id;
-            self.selected_id = prev_state.selected_id;
+            self.selected_ids = prev_state.selected_ids;
             self.artboard = prev_state.artboard;
             self.clip_to_artboard = prev_state.clip_to_artboard;
             true
@@ -149,7 +193,7 @@ impl VectorEngine {
             let current_state = EngineState {
                 objects: self.objects.clone(),
                 next_id: self.next_id,
-                selected_id: self.selected_id,
+                selected_ids: self.selected_ids.clone(),
                 artboard: self.artboard.clone(),
                 clip_to_artboard: self.clip_to_artboard,
             };
@@ -157,7 +201,7 @@ impl VectorEngine {
 
             self.objects = next_state.objects;
             self.next_id = next_state.next_id;
-            self.selected_id = next_state.selected_id;
+            self.selected_ids = next_state.selected_ids;
             self.artboard = next_state.artboard;
             self.clip_to_artboard = next_state.clip_to_artboard;
             true
@@ -194,6 +238,8 @@ impl VectorEngine {
                     Some("Polygon") => ShapeType::Polygon,
                     Some("Image") => ShapeType::Image,
                     Some("Path") => ShapeType::Path,
+                    Some("Text") => ShapeType::Text,
+                    Some("Group") => ShapeType::Group,
                     _ => ShapeType::Rectangle,
                 };
                 let id = self.add_object(
@@ -212,26 +258,78 @@ impl VectorEngine {
                 if cmd.params["save_undo"].as_bool().unwrap_or(false) {
                     self.save_state();
                 }
-                let id = cmd.params["id"].as_u64().map(|v| v as u32).unwrap_or(0);
-                if self.update_object(id, &cmd.params) {
-                    "{{\"success\": true}}".to_string()
+                let mut success = false;
+                if let Some(ids) = cmd.params["ids"].as_array() {
+                    for id_val in ids {
+                        if let Some(id) = id_val.as_u64() {
+                            if self.update_object(id as u32, &cmd.params) {
+                                success = true;
+                            }
+                        }
+                    }
                 } else {
-                    "{{\"error\": \"Object not found\"}}".to_string()
+                    let id = cmd.params["id"].as_u64().map(|v| v as u32).unwrap_or(0);
+                    if self.update_object(id, &cmd.params) {
+                        success = true;
+                    }
+                }
+                
+                if success {
+                    "{\"success\": true}".to_string()
+                } else {
+                    "{\"error\": \"Object(s) not found\"}".to_string()
                 }
             }
             "delete" => {
                 self.save_state();
-                let id = cmd.params["id"].as_u64().map(|v| v as u32).unwrap_or(0);
-                if self.delete_object(id) {
-                    "{{\"success\": true}}".to_string()
+                let mut success = false;
+                if let Some(ids) = cmd.params["ids"].as_array() {
+                    for id_val in ids {
+                        if let Some(id) = id_val.as_u64() {
+                            if self.delete_object(id as u32) {
+                                success = true;
+                            }
+                        }
+                    }
                 } else {
-                    "{{\"error\": \"Object not found\"}}".to_string()
+                    let id = cmd.params["id"].as_u64().map(|v| v as u32).unwrap_or(0);
+                    if self.delete_object(id) {
+                        success = true;
+                    }
+                }
+                if success {
+                    "{\"success\": true}".to_string()
+                } else {
+                    "{\"error\": \"Object(s) not found\"}".to_string()
+                }
+            }
+            "duplicate" => {
+                self.save_state();
+                let id = cmd.params["id"].as_u64().map(|v| v as u32).unwrap_or(0);
+                if let Some(pos) = self.objects.iter().position(|o| o.id == id) {
+                    let mut new_obj = self.objects[pos].clone();
+                    new_obj.id = self.next_id;
+                    self.next_id += 1;
+                    new_obj.x += 10.0;
+                    new_obj.y += 10.0;
+                    new_obj.name = format!("{} copy", new_obj.name);
+                    let new_id = new_obj.id;
+                    self.objects.insert(pos + 1, new_obj);
+                    self.selected_ids = vec![new_id];
+                    format!("{{\"success\": true, \"id\": {}}}", new_id)
+                } else {
+                    "{\"error\": \"Object not found\"}".to_string()
                 }
             }
             "select" => {
-                let id = cmd.params["id"].as_u64().map(|v| v as u32);
-                self.selected_id = id;
-                "{{\"success\": true}}".to_string()
+                if let Some(ids) = cmd.params["ids"].as_array() {
+                    self.selected_ids = ids.iter().filter_map(|v| v.as_u64().map(|id| id as u32)).collect();
+                } else if let Some(id) = cmd.params["id"].as_u64() {
+                    self.selected_ids = vec![id as u32];
+                } else {
+                    self.selected_ids.clear();
+                }
+                "{\"success\": true}".to_string()
             }
             "move_to_back" => {
                 self.save_state();
@@ -239,9 +337,9 @@ impl VectorEngine {
                 if let Some(pos) = self.objects.iter().position(|o| o.id == id) {
                     let obj = self.objects.remove(pos);
                     self.objects.insert(0, obj);
-                    "{{\"success\": true}}".to_string()
+                    "{\"success\": true}".to_string()
                 } else {
-                    "{{\"error\": \"Object not found\"}}".to_string()
+                    "{\"error\": \"Object not found\"}".to_string()
                 }
             }
             "move_to_front" => {
@@ -250,9 +348,37 @@ impl VectorEngine {
                 if let Some(pos) = self.objects.iter().position(|o| o.id == id) {
                     let obj = self.objects.remove(pos);
                     self.objects.push(obj);
-                    "{{\"success\": true}}".to_string()
+                    "{\"success\": true}".to_string()
                 } else {
-                    "{{\"error\": \"Object not found\"}}".to_string()
+                    "{\"error\": \"Object not found\"}".to_string()
+                }
+            }
+            "move_forward" => {
+                self.save_state();
+                let id = cmd.params["id"].as_u64().map(|v| v as u32).unwrap_or(0);
+                if let Some(pos) = self.objects.iter().position(|o| o.id == id) {
+                    if pos < self.objects.len() - 1 {
+                        self.objects.swap(pos, pos + 1);
+                        "{\"success\": true}".to_string()
+                    } else {
+                        "{\"success\": true, \"message\": \"Already at front\"}".to_string()
+                    }
+                } else {
+                    "{\"error\": \"Object not found\"}".to_string()
+                }
+            }
+            "move_backward" => {
+                self.save_state();
+                let id = cmd.params["id"].as_u64().map(|v| v as u32).unwrap_or(0);
+                if let Some(pos) = self.objects.iter().position(|o| o.id == id) {
+                    if pos > 0 {
+                        self.objects.swap(pos, pos - 1);
+                        "{\"success\": true}".to_string()
+                    } else {
+                        "{\"success\": true, \"message\": \"Already at back\"}".to_string()
+                    }
+                } else {
+                    "{\"error\": \"Object not found\"}".to_string()
                 }
             }
             "set_artboard" => {
@@ -260,19 +386,19 @@ impl VectorEngine {
                 if let Some(w) = cmd.params["width"].as_f64() { self.artboard.width = w; }
                 if let Some(h) = cmd.params["height"].as_f64() { self.artboard.height = h; }
                 if let Some(bg) = cmd.params["background"].as_str() { self.artboard.background = bg.to_string(); }
-                "{{\"success\": true}}".to_string()
+                "{\"success\": true}".to_string()
             }
             "set_clipping" => {
                 self.save_state();
                 if let Some(v) = cmd.params["enabled"].as_bool() { self.clip_to_artboard = v; }
-                "{{\"success\": true}}".to_string()
+                "{\"success\": true}".to_string()
             }
             "clear" => {
                 self.save_state();
                 self.objects.clear();
                 self.next_id = 1;
-                self.selected_id = None;
-                "{{\"success\": true}}".to_string()
+                self.selected_ids.clear();
+                "{\"success\": true}".to_string()
             }
             _ => format!("{{\"error\": \"Unknown action: {}\"}}", cmd.action),
         }
@@ -288,14 +414,14 @@ impl VectorEngine {
         } else if filename.to_lowercase().ends_with(".ai") {
             self.import_ai(data)
         } else {
-            "{{\"error\": \"Unsupported file format\"}}".to_string()
+            "{\"error\": \"Unsupported file format\"}".to_string()
         }
     }
 
     fn import_psd(&mut self, data: &[u8]) -> String {
         let psd = match Psd::from_bytes(data) {
             Ok(p) => p,
-            Err(_) => return "{{\"error\": \"Failed to parse PSD\"}}".to_string(),
+            Err(_) => return "{\"error\": \"Failed to parse PSD\"}".to_string(),
         };
 
         let mut imported_objects = Vec::new();
@@ -370,12 +496,29 @@ impl VectorEngine {
                         inner_radius: 0.0,
                         corner_radius: 0.0,
                         path_data: String::new(),
+                        text_content: String::new(),
+                        font_family: "Inter, sans-serif".to_string(),
+                        font_size: 24.0,
+                        font_weight: "normal".to_string(),
+                        text_align: "left".to_string(),
+                        shadow_color: "transparent".to_string(),
+                        shadow_blur: 0.0,
+                        shadow_offset_x: 0.0,
+                        shadow_offset_y: 0.0,
                         sx: 0.0,
                         sy: 0.0,
                         sw: width as f64,
                         sh: height as f64,
+                        brightness: 1.0,
+                        contrast: 1.0,
+                        saturate: 1.0,
+                        hue_rotate: 0.0,
+                        blur: 0.0,
                         image_data_url: Some(data_url),
                         image: None,
+                        fill_gradient: None,
+                        stroke_gradient: None,
+                        children: None,
                     };
                     
                     self.objects.push(obj.clone());
@@ -386,30 +529,30 @@ impl VectorEngine {
         
         match serde_json::to_string(&imported_objects) {
             Ok(s) => s,
-            Err(_) => "{{\"error\": \"Serialization failed\"}}".to_string(),
+            Err(_) => "{\"error\": \"Serialization failed\"}".to_string(),
         }
     }
 
     fn import_ai(&mut self, data: &[u8]) -> String {
         let doc = match Document::load_mem(data) {
              Ok(d) => d,
-             Err(_) => return "{{\"error\": \"Failed to parse AI/PDF file\"}}".to_string(),
+             Err(_) => return "{\"error\": \"Failed to parse AI/PDF file\"}".to_string(),
         };
         
         let pages = doc.get_pages();
         if pages.is_empty() {
-             return "{{\"error\": \"No pages found in AI file\"}}".to_string();
+             return "{\"error\": \"No pages found in AI file\"}".to_string();
         }
         let page_id = *pages.values().next().unwrap();
         
         let content_data = match doc.get_page_content(page_id) {
             Ok(c) => c,
-            Err(_) => return "{{\"error\": \"Failed to get page content\"}}".to_string(),
+            Err(_) => return "{\"error\": \"Failed to get page content\"}".to_string(),
         };
         
         let content = match Content::decode(&content_data) {
              Ok(c) => c,
-             Err(_) => return "{{\"error\": \"Failed to decode page content\"}}".to_string(),
+             Err(_) => return "{\"error\": \"Failed to decode page content\"}".to_string(),
         };
         
         #[derive(Clone)]
@@ -599,7 +742,19 @@ impl VectorEngine {
                                 opacity: 1.0, visible: true, locked: false,
                                 sides: 0, inner_radius: 0.0, corner_radius: 0.0,
                                 path_data: new_path,
-                                sx: 0.0, sy: 0.0, sw: 0.0, sh: 0.0, image_data_url: None, image: None,
+                                text_content: String::new(),
+                                font_family: "Inter, sans-serif".to_string(),
+                                font_size: 24.0,
+                                font_weight: "normal".to_string(),
+                                text_align: "left".to_string(),
+                                shadow_color: "transparent".to_string(),
+                                shadow_blur: 0.0,
+                                shadow_offset_x: 0.0,
+                                shadow_offset_y: 0.0,
+                                sx: 0.0, sy: 0.0, sw: 0.0, sh: 0.0,
+                                brightness: 1.0, contrast: 1.0, saturate: 1.0, hue_rotate: 0.0, blur: 0.0,
+                                image_data_url: None, image: None,
+                                fill_gradient: None, stroke_gradient: None, children: None,
                             });
                         }
                         current_path.clear();
@@ -631,7 +786,19 @@ impl VectorEngine {
                                 opacity: 1.0, visible: true, locked: false,
                                 sides: 0, inner_radius: 0.0, corner_radius: 0.0,
                                 path_data: new_path,
-                                sx: 0.0, sy: 0.0, sw: 0.0, sh: 0.0, image_data_url: None, image: None,
+                                text_content: String::new(),
+                                font_family: "Inter, sans-serif".to_string(),
+                                font_size: 24.0,
+                                font_weight: "normal".to_string(),
+                                text_align: "left".to_string(),
+                                shadow_color: "transparent".to_string(),
+                                shadow_blur: 0.0,
+                                shadow_offset_x: 0.0,
+                                shadow_offset_y: 0.0,
+                                sx: 0.0, sy: 0.0, sw: 0.0, sh: 0.0,
+                                brightness: 1.0, contrast: 1.0, saturate: 1.0, hue_rotate: 0.0, blur: 0.0,
+                                image_data_url: None, image: None,
+                                fill_gradient: None, stroke_gradient: None, children: None,
                             });
                         }
                         current_path.clear();
@@ -663,7 +830,19 @@ impl VectorEngine {
                                 opacity: 1.0, visible: true, locked: false,
                                 sides: 0, inner_radius: 0.0, corner_radius: 0.0,
                                 path_data: new_path,
-                                sx: 0.0, sy: 0.0, sw: 0.0, sh: 0.0, image_data_url: None, image: None,
+                                text_content: String::new(),
+                                font_family: "Inter, sans-serif".to_string(),
+                                font_size: 24.0,
+                                font_weight: "normal".to_string(),
+                                text_align: "left".to_string(),
+                                shadow_color: "transparent".to_string(),
+                                shadow_blur: 0.0,
+                                shadow_offset_x: 0.0,
+                                shadow_offset_y: 0.0,
+                                sx: 0.0, sy: 0.0, sw: 0.0, sh: 0.0,
+                                brightness: 1.0, contrast: 1.0, saturate: 1.0, hue_rotate: 0.0, blur: 0.0,
+                                image_data_url: None, image: None,
+                                fill_gradient: None, stroke_gradient: None, children: None,
                             });
                         }
                         current_path.clear();
@@ -710,12 +889,29 @@ impl VectorEngine {
             inner_radius: 0.5,
             corner_radius: 0.0,
             path_data: String::new(),
+            text_content: "Type here...".to_string(),
+            font_family: "Inter, sans-serif".to_string(),
+            font_size: 24.0,
+            font_weight: "normal".to_string(),
+            text_align: "left".to_string(),
+            shadow_color: "transparent".to_string(),
+            shadow_blur: 0.0,
+            shadow_offset_x: 0.0,
+            shadow_offset_y: 0.0,
             sx: 0.0,
             sy: 0.0,
             sw: 0.0,
             sh: 0.0,
+            brightness: 1.0,
+            contrast: 1.0,
+            saturate: 1.0,
+            hue_rotate: 0.0,
+            blur: 0.0,
             image_data_url: None,
             image: None,
+            fill_gradient: None,
+            stroke_gradient: None,
+            children: None,
         });
         self.next_id += 1;
         id
@@ -736,12 +932,33 @@ impl VectorEngine {
             if let Some(v) = params["stroke"].as_str() { obj.stroke = v.to_string(); }
             if let Some(v) = params["stroke_width"].as_f64() { obj.stroke_width = v; }
             if let Some(v) = params["opacity"].as_f64() { obj.opacity = v; }
+            if let Some(v) = params["visible"].as_bool() { obj.visible = v; }
+            if let Some(v) = params["blend_mode"].as_str() { obj.blend_mode = v.to_string(); }
+            if let Some(v) = params["stroke_cap"].as_str() { obj.stroke_cap = v.to_string(); }
+            if let Some(v) = params["stroke_join"].as_str() { obj.stroke_join = v.to_string(); }
+            if let Some(arr) = params["stroke_dash"].as_array() {
+                obj.stroke_dash = arr.iter().filter_map(|v| v.as_f64()).collect();
+            }
             if let Some(v) = params["name"].as_str() { obj.name = v.to_string(); }
             if let Some(v) = params["locked"].as_bool() { obj.locked = v; }
             if let Some(v) = params["sides"].as_u64() { obj.sides = v as u32; }
             if let Some(v) = params["inner_radius"].as_f64() { obj.inner_radius = v; }
             if let Some(v) = params["corner_radius"].as_f64() { obj.corner_radius = v; }
             if let Some(v) = params["path_data"].as_str() { obj.path_data = v.to_string(); }
+            if let Some(v) = params["brightness"].as_f64() { obj.brightness = v; }
+            if let Some(v) = params["contrast"].as_f64() { obj.contrast = v; }
+            if let Some(v) = params["saturate"].as_f64() { obj.saturate = v; }
+            if let Some(v) = params["hue_rotate"].as_f64() { obj.hue_rotate = v; }
+            if let Some(v) = params["blur"].as_f64() { obj.blur = v; }
+            if let Some(v) = params["text_content"].as_str() { obj.text_content = v.to_string(); }
+            if let Some(v) = params["font_family"].as_str() { obj.font_family = v.to_string(); }
+            if let Some(v) = params["font_size"].as_f64() { obj.font_size = v; }
+            if let Some(v) = params["font_weight"].as_str() { obj.font_weight = v.to_string(); }
+            if let Some(v) = params["text_align"].as_str() { obj.text_align = v.to_string(); }
+            if let Some(v) = params["shadow_color"].as_str() { obj.shadow_color = v.to_string(); }
+            if let Some(v) = params["shadow_blur"].as_f64() { obj.shadow_blur = v; }
+            if let Some(v) = params["shadow_offset_x"].as_f64() { obj.shadow_offset_x = v; }
+            if let Some(v) = params["shadow_offset_y"].as_f64() { obj.shadow_offset_y = v; }
             true
         } else {
             false
@@ -751,32 +968,152 @@ impl VectorEngine {
     fn delete_object(&mut self, id: u32) -> bool {
         let initial_len = self.objects.len();
         self.objects.retain(|o| o.id != id);
-        if self.selected_id == Some(id) {
-            self.selected_id = None;
-        }
+        self.selected_ids.retain(|&sid| sid != id);
         self.objects.len() < initial_len
     }
 
-    pub fn select_at(&mut self, x: f64, y: f64) -> Option<u32> {
-        // Adjust x,y for viewport
+    pub fn select_point(&mut self, x: f64, y: f64, shift: bool) -> String {
         let tx = (x - self.viewport_x) / self.viewport_zoom;
         let ty = (y - self.viewport_y) / self.viewport_zoom;
 
+        let mut hit_id = None;
         for obj in self.objects.iter().rev() {
             if obj.locked { continue; }
-            // Simple AABB for now, ideally would handle rotation
-            if tx >= obj.x && tx <= obj.x + obj.width && ty >= obj.y && ty <= obj.y + obj.height {
-                self.selected_id = Some(obj.id);
-                return Some(obj.id);
+            
+            // Transform point to object's local space
+            let cx = obj.x + obj.width / 2.0;
+            let cy = obj.y + obj.height / 2.0;
+            
+            // 1. Translate point to be relative to center
+            let px = tx - cx;
+            let py = ty - cy;
+            
+            // 2. Rotate point by -obj.rotation
+            let cos_r = (-obj.rotation).cos();
+            let sin_r = (-obj.rotation).sin();
+            let rx = px * cos_r - py * sin_r;
+            let ry = px * sin_r + py * cos_r;
+            
+            // 3. Check if point is within unrotated bounds (relative to center)
+            if rx >= -obj.width / 2.0 && rx <= obj.width / 2.0 && ry >= -obj.height / 2.0 && ry <= obj.height / 2.0 {
+                hit_id = Some(obj.id);
+                break;
             }
         }
-        self.selected_id = None;
-        None
+
+        if !shift {
+            self.selected_ids.clear();
+        }
+
+        if let Some(id) = hit_id {
+            if shift {
+                if let Some(pos) = self.selected_ids.iter().position(|&x| x == id) {
+                    self.selected_ids.remove(pos);
+                } else {
+                    self.selected_ids.push(id);
+                }
+            } else {
+                self.selected_ids.push(id);
+            }
+        }
+
+        self.get_selected_ids()
     }
 
-    pub fn get_selected_id(&self) -> i32 {
-        self.selected_id.map(|id| id as i32).unwrap_or(-1)
+    pub fn select_rect(&mut self, x: f64, y: f64, width: f64, height: f64, shift: bool) -> String {
+        // x,y,width,height are in screen coords. Convert to world.
+        // But wait, user might drag negative width/height. Normalize first.
+        let mut sx = x;
+        let mut sy = y;
+        let mut sw = width;
+        let mut sh = height;
+
+        if sw < 0.0 { sx += sw; sw = -sw; }
+        if sh < 0.0 { sy += sh; sh = -sh; }
+
+        let x1 = (sx - self.viewport_x) / self.viewport_zoom;
+        let y1 = (sy - self.viewport_y) / self.viewport_zoom;
+        let x2 = (sx + sw - self.viewport_x) / self.viewport_zoom;
+        let y2 = (sy + sh - self.viewport_y) / self.viewport_zoom;
+
+        if !shift {
+            self.selected_ids.clear();
+        }
+
+        for obj in &self.objects {
+            if obj.locked { continue; }
+            // Check if object center is in selection rect (simple approx)
+            // or if object intersects. For now, let's say "fully contained" or "intersects center"
+            // Let's go with "intersects" which is standard for box select.
+            
+            let obj_x2 = obj.x + obj.width;
+            let obj_y2 = obj.y + obj.height;
+
+            // AABB intersection
+            if obj.x < x2 && obj_x2 > x1 && obj.y < y2 && obj_y2 > y1 {
+                 if !self.selected_ids.contains(&obj.id) {
+                     self.selected_ids.push(obj.id);
+                 }
+            }
+        }
+
+        self.get_selected_ids()
     }
+
+    pub fn get_selected_ids(&self) -> String {
+        serde_json::to_string(&self.selected_ids).unwrap_or("[]".to_string())
+    }
+
+    pub fn hit_test_handles(&self, x: f64, y: f64) -> String {
+        let tx = (x - self.viewport_x) / self.viewport_zoom;
+        let ty = (y - self.viewport_y) / self.viewport_zoom;
+
+        // Only check the primary selected object (last one)
+        if let Some(&id) = self.selected_ids.last() {
+            if let Some(obj) = self.objects.iter().find(|o| o.id == id) {
+                let cx = obj.x + obj.width / 2.0;
+                let cy = obj.y + obj.height / 2.0;
+                
+                let px = tx - cx;
+                let py = ty - cy;
+                
+                let cos_r = (-obj.rotation).cos();
+                let sin_r = (-obj.rotation).sin();
+                let rx = px * cos_r - py * sin_r;
+                let ry = px * sin_r + py * cos_r;
+                
+                let local_x = rx + obj.width / 2.0;
+                let local_y = ry + obj.height / 2.0;
+
+                let handle_radius = 6.0 / self.viewport_zoom;
+                let rotate_offset = -30.0 / self.viewport_zoom;
+
+                let handles = [
+                    (0.0, 0.0, HandleType::TopLeft),
+                    (obj.width, 0.0, HandleType::TopRight),
+                    (0.0, obj.height, HandleType::BottomLeft),
+                    (obj.width, obj.height, HandleType::BottomRight),
+                    (obj.width / 2.0, 0.0, HandleType::Top),
+                    (obj.width / 2.0, obj.height, HandleType::Bottom),
+                    (0.0, obj.height / 2.0, HandleType::Left),
+                    (obj.width, obj.height / 2.0, HandleType::Right),
+                    (obj.width / 2.0, rotate_offset, HandleType::Rotate),
+                ];
+
+                for (hx, hy, h_type) in handles.iter() {
+                    let dist = ((local_x - hx).powi(2) + (local_y - hy).powi(2)).sqrt();
+                    if dist <= handle_radius {
+                        return serde_json::to_string(&(id, *h_type)).unwrap_or("null".to_string());
+                    }
+                }
+            }
+        }
+        "null".to_string()
+    }
+
+    // Keep legacy for compatibility if needed, or remove? 
+    // It's safer to remove and fix calls to ensure I found all usages.
+
 
     pub fn get_objects_json(&self) -> String {
         serde_json::to_string(&self.objects).unwrap_or_else(|_| "[]".to_string())
@@ -814,23 +1151,91 @@ impl VectorEngine {
         ctx.fill_rect(0.0, 0.0, self.artboard.width, self.artboard.height);
 
         for obj in &self.objects {
-            if !obj.visible { continue; }
-            
-            ctx.save();
-            ctx.set_global_alpha(obj.opacity);
-            ctx.set_global_composite_operation(&obj.blend_mode).unwrap_or(());
-            
-            // Transform for object
-            ctx.translate(obj.x + obj.width / 2.0, obj.y + obj.height / 2.0).unwrap();
-            ctx.rotate(obj.rotation).unwrap();
-            ctx.translate(-obj.width / 2.0, -obj.height / 2.0).unwrap();
+            self.render_object(ctx, obj);
+        }
+        ctx.restore();
+        ctx.restore();
+    }
 
-            ctx.set_fill_style(&JsValue::from_str(&obj.fill));
-            ctx.set_stroke_style(&JsValue::from_str(&obj.stroke));
+    fn render_object(&self, ctx: &web_sys::CanvasRenderingContext2d, obj: &VectorObject) {
+        if !obj.visible { return; }
+        
+        ctx.save();
+        ctx.set_global_alpha(obj.opacity);
+        ctx.set_global_composite_operation(&obj.blend_mode).unwrap_or(());
+        
+        // Apply Filters
+        if obj.shape_type == ShapeType::Image {
+             let filter = format!(
+                "brightness({}%) contrast({}%) saturate({}%) hue-rotate({}deg) blur({}px)",
+                obj.brightness * 100.0,
+                obj.contrast * 100.0,
+                obj.saturate * 100.0,
+                obj.hue_rotate,
+                obj.blur
+            );
+            ctx.set_filter(&filter);
+        }
+        
+        // Transform for object
+        ctx.translate(obj.x + obj.width / 2.0, obj.y + obj.height / 2.0).unwrap();
+        ctx.rotate(obj.rotation).unwrap();
+        ctx.translate(-obj.width / 2.0, -obj.height / 2.0).unwrap();
+
+        // Recursively render children if Group
+        if obj.shape_type == ShapeType::Group {
+            if let Some(children) = &obj.children {
+                for child in children {
+                    self.render_object(ctx, child);
+                }
+            }
+        } else {
+            // Apply Fill
+            if let Some(grad) = &obj.fill_gradient {
+                let canvas_grad_opt = if grad.is_radial {
+                    ctx.create_radial_gradient(grad.x1, grad.y1, grad.r1, grad.x2, grad.y2, grad.r2).ok()
+                } else {
+                    Some(ctx.create_linear_gradient(grad.x1, grad.y1, grad.x2, grad.y2))
+                };
+
+                if let Some(canvas_grad) = canvas_grad_opt {
+                    for stop in &grad.stops {
+                        let _ = canvas_grad.add_color_stop(stop.offset as f32, &stop.color);
+                    }
+                    ctx.set_fill_style(&canvas_grad);
+                }
+            } else {
+                ctx.set_fill_style(&JsValue::from_str(&obj.fill));
+            }
+
+            // Apply Stroke
+            if let Some(grad) = &obj.stroke_gradient {
+                let canvas_grad_opt = if grad.is_radial {
+                    ctx.create_radial_gradient(grad.x1, grad.y1, grad.r1, grad.x2, grad.y2, grad.r2).ok()
+                } else {
+                    Some(ctx.create_linear_gradient(grad.x1, grad.y1, grad.x2, grad.y2))
+                };
+
+                if let Some(canvas_grad) = canvas_grad_opt {
+                    for stop in &grad.stops {
+                        let _ = canvas_grad.add_color_stop(stop.offset as f32, &stop.color);
+                    }
+                    ctx.set_stroke_style(&canvas_grad);
+                }
+            } else {
+                ctx.set_stroke_style(&JsValue::from_str(&obj.stroke));
+            }
+            
             ctx.set_line_width(obj.stroke_width);
             ctx.set_line_cap(&obj.stroke_cap);
             ctx.set_line_join(&obj.stroke_join);
             
+            // Apply Shadow
+            ctx.set_shadow_color(&obj.shadow_color);
+            ctx.set_shadow_blur(obj.shadow_blur);
+            ctx.set_shadow_offset_x(obj.shadow_offset_x);
+            ctx.set_shadow_offset_y(obj.shadow_offset_y);
+
             // Set dash
             if !obj.stroke_dash.is_empty() {
                  let dash_array = js_sys::Array::new();
@@ -895,19 +1300,60 @@ impl VectorEngine {
                          }
                     }
                 }
+                ShapeType::Text => {
+                    ctx.set_font(&format!("{} {}px {}", obj.font_weight, obj.font_size, obj.font_family));
+                    ctx.set_text_align(&obj.text_align);
+                    let _ = ctx.fill_text(&obj.text_content, 0.0, obj.font_size);
+                    if obj.stroke_width > 0.0 {
+                        let _ = ctx.stroke_text(&obj.text_content, 0.0, obj.font_size);
+                    }
+                }
+                _ => {}
             }
-
-            // Draw selection highlight (relative to object space)
-            if Some(obj.id) == self.selected_id {
-                ctx.set_stroke_style(&JsValue::from_str("#4facfe"));
-                ctx.set_line_width(2.0 / self.viewport_zoom);
-                ctx.set_line_dash(&js_sys::Array::new()).unwrap(); // Reset dash for selection
-                ctx.stroke_rect(-2.0, -2.0, obj.width + 4.0, obj.height + 4.0);
-            }
-
-            ctx.restore();
         }
-        ctx.restore();
+
+        // Draw selection highlight (relative to object space)
+        if self.selected_ids.contains(&obj.id) {
+            ctx.set_stroke_style(&JsValue::from_str("#4facfe"));
+            ctx.set_line_width(1.5 / self.viewport_zoom);
+            ctx.set_line_dash(&js_sys::Array::new()).unwrap(); 
+            ctx.stroke_rect(0.0, 0.0, obj.width, obj.height);
+
+            // Only draw handles for the primary selection
+            if self.selected_ids.last() == Some(&obj.id) {
+                let handle_size = 8.0 / self.viewport_zoom;
+                let rotate_offset = -30.0 / self.viewport_zoom;
+                
+                ctx.set_fill_style(&JsValue::from_str("#ffffff"));
+                ctx.set_stroke_style(&JsValue::from_str("#4facfe"));
+                ctx.set_line_width(1.0 / self.viewport_zoom);
+
+                let handles = [
+                    (0.0, 0.0), (obj.width, 0.0), (0.0, obj.height), (obj.width, obj.height),
+                    (obj.width / 2.0, 0.0), (obj.width / 2.0, obj.height), 
+                    (0.0, obj.height / 2.0), (obj.width, obj.height / 2.0),
+                ];
+
+                for (hx, hy) in handles {
+                    ctx.begin_path();
+                    ctx.rect(hx - handle_size/2.0, hy - handle_size/2.0, handle_size, handle_size);
+                    ctx.fill();
+                    ctx.stroke();
+                }
+
+                // Rotation handle
+                ctx.begin_path();
+                ctx.move_to(obj.width / 2.0, 0.0);
+                ctx.line_to(obj.width / 2.0, rotate_offset);
+                ctx.stroke();
+
+                ctx.begin_path();
+                ctx.arc(obj.width / 2.0, rotate_offset, handle_size / 2.0, 0.0, std::f64::consts::PI * 2.0).unwrap();
+                ctx.fill();
+                ctx.stroke();
+            }
+        }
+
         ctx.restore();
     }
 
