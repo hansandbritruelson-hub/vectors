@@ -4,8 +4,7 @@ import { removeBackground, type Config } from "@imgly/background-removal";
 const SELECTED_MODEL = "Mistral-7B-Instruct-v0.3-q4f16_1-MLC";
 
 export interface AICommand {
-  action?: string;
-  command?: string; // Legacy support
+  action: string;
   params: any;
 }
 
@@ -155,7 +154,7 @@ class AIService {
     if (Array.isArray(parsed)) return parsed;
     if (parsed && typeof parsed === 'object') {
       // If it's a single command object
-      if (parsed.action || parsed.command) return [parsed as AICommand];
+      if (parsed.action) return [parsed as AICommand];
       // If it's an object containing an array (e.g., { "commands": [...] })
       if (parsed.commands && Array.isArray(parsed.commands)) return parsed.commands;
     }

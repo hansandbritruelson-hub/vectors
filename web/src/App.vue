@@ -7,10 +7,10 @@ import {
     MousePointer2, Square, Circle, PenTool, Crop, 
     Star, Hexagon, Pipette, Wand2, Type, Upload,
     Trash2, Copy, BringToFront, SendToBack, ChevronUp, ChevronDown,
-    Pencil, Eraser, Hand, Search, RotateCw
+    Pencil, Eraser, Hand, Search, RotateCw, PaintBucket
 } from 'lucide-vue-next';
 
-type Tool = 'select' | 'rect' | 'circle' | 'image' | 'bezier' | 'crop' | 'star' | 'poly' | 'eyedropper' | 'magic' | 'text' | 'pencil' | 'eraser' | 'hand' | 'zoom' | 'rotate';
+type Tool = 'select' | 'rect' | 'circle' | 'image' | 'bezier' | 'crop' | 'star' | 'poly' | 'eyedropper' | 'magic' | 'text' | 'pencil' | 'eraser' | 'hand' | 'zoom' | 'rotate' | 'gradient';
 
 const canvas = ref<HTMLCanvasElement | null>(null);
 const canvasContainer = ref<HTMLElement | null>(null);
@@ -71,6 +71,52 @@ const cropState = ref({
     currentY: 0,
 });
 
+const gradientState = ref({
+    isDragging: false,
+    dragType: null as 'start' | 'end' | 'stop' | null,
+    dragIndex: -1,
+    activeStopIndex: -1,
+});
+
+function worldToLocal(obj: any, wx: number, wy: number) {
+    const cx = obj.x + obj.width / 2;
+    const cy = obj.y + obj.height / 2;
+    const dx = wx - cx;
+    const dy = wy - cy;
+    const cos_r = Math.cos(-obj.rotation);
+    const sin_r = Math.sin(-obj.rotation);
+    // Rotate back
+    const rx = dx * cos_r - dy * sin_r;
+    const ry = dx * sin_r + dy * cos_r;
+    // Translate to top-left origin
+    return {
+        x: rx + obj.width / 2,
+        y: ry + obj.height / 2
+    };
+}
+
+function localToWorld(obj: any, lx: number, ly: number) {
+    // Translate from top-left origin to center-relative
+    const rx = lx - obj.width / 2;
+    const ry = ly - obj.height / 2;
+    
+    const cos_r = Math.cos(obj.rotation);
+    const sin_r = Math.sin(obj.rotation);
+    
+    // Rotate
+    const dx = rx * cos_r - ry * sin_r;
+    const dy = rx * sin_r + ry * cos_r;
+    
+    // Translate to world center
+    const cx = obj.x + obj.width / 2;
+    const cy = obj.y + obj.height / 2;
+    
+    return {
+        x: cx + dx,
+        y: cy + dy
+    };
+}
+
 function safeColor(color: string): string {
     if (!color || color === 'transparent' || !/^#[0-9A-F]{6}$/i.test(color)) {
         return '#000000';
@@ -88,12 +134,119 @@ interface BezierPoint {
 
 const bezierState = ref({
     isDrawing: false,
+    isEditing: false,
     points: [] as BezierPoint[],
     currentObjId: -1,
     isSnapped: false,
     isClosing: false,
     mousePoint: null as { x: number, y: number } | null,
+    dragIndex: -1,
+    dragType: null as 'anchor' | 'cin' | 'cout' | null,
 });
+
+function parsePathData(d: string, offsetX: number, offsetY: number): BezierPoint[] {
+    const points: BezierPoint[] = [];
+    if (!d) return points;
+
+    // Normalize spaces and split
+    const commands = d.replace(/([a-zA-Z])/g, ' $1 ').trim().split(/\s+(?=[a-zA-Z])/);
+    
+    let currentPoint: BezierPoint | null = null;
+    let firstPoint: BezierPoint | null = null;
+
+    commands.forEach(cmdStr => {
+        const type = cmdStr.trim()[0];
+        const args = cmdStr.substring(1).trim().split(/[\s,]+/).map(parseFloat);
+
+        if (type === 'M') {
+            currentPoint = {
+                x: args[0] + offsetX,
+                y: args[1] + offsetY,
+                cin: { x: args[0] + offsetX, y: args[1] + offsetY },
+                cout: { x: args[0] + offsetX, y: args[1] + offsetY }
+            };
+            points.push(currentPoint);
+            firstPoint = currentPoint;
+        } else if (type === 'C') {
+            // C x1 y1, x2 y2, x y
+            // prev.cout = x1, y1
+            // curr.cin = x2, y2
+            // curr = x, y
+            if (points.length > 0) {
+                const prev = points[points.length - 1];
+                prev.cout = { x: args[0] + offsetX, y: args[1] + offsetY };
+            }
+            
+            currentPoint = {
+                x: args[4] + offsetX,
+                y: args[5] + offsetY,
+                cin: { x: args[2] + offsetX, y: args[3] + offsetY },
+                cout: { x: args[4] + offsetX, y: args[5] + offsetY } // Default cout = anchor
+            };
+            points.push(currentPoint);
+        } else if (type === 'Z') {
+             // Closed.
+             // Usually implies the last point connects to first.
+             // getPathString adds a C command for this.
+             // If we just parsed a C that ends at firstPoint, we might have a duplicate.
+             // Let's check dist
+             if (currentPoint && firstPoint) {
+                 const dx = currentPoint.x - firstPoint.x;
+                 const dy = currentPoint.y - firstPoint.y;
+                 if (Math.abs(dx) < 0.1 && Math.abs(dy) < 0.1) {
+                     // The last point IS the first point (geometrically)
+                     // But strictly speaking, in our point list, we want unique points.
+                     // The loop is formed by connecting last to first.
+                     // If the SVG explicitly had a point at the start, we might have added it.
+                     // Let's remove the last point if it's identical to first
+                     points.pop();
+                     // And fix the cout of the NEW last point (which was the prev point)
+                     // The C command we just popped had control points.
+                     // C cp1 cp2 P_first
+                     // The prev point (now last) should have cout = cp1
+                     // The first point should have cin = cp2
+                     
+                     // We need to retrieve the args of the C command that created the popped point.
+                     // But we just popped it.
+                     // This is getting complicated to reverse-engineer perfectly without lookahead/lookbehind.
+                     
+                     // Alternative: Just mark isClosing = true if we detect Z?
+                     // But we need to set the state correctly.
+                 }
+             }
+             bezierState.value.isClosing = true;
+        }
+    });
+    
+    // If Z was present, we need to wire up the loop control points if they exist.
+    // The C command before Z: C cp1 cp2 P_first
+    // We processed it as: prev.cout=cp1, P_dup.cin=cp2, P_dup=P_first.
+    // If we popped P_dup:
+    // We need prev.cout (already set correctly to cp1).
+    // We need P_first.cin = cp2.
+    // But P_first is points[0].
+    
+    // Let's refine the loop handling:
+    // If we detect Z, we assume the path is closed.
+    // If the last command was C, we check if it closed the loop.
+    
+    // Actually, simpler approach for now: 
+    // Just parse points. If last point is same as first, merge them.
+    if (points.length > 1) {
+        const first = points[0];
+        const last = points[points.length - 1];
+        if (Math.abs(first.x - last.x) < 0.01 && Math.abs(first.y - last.y) < 0.01) {
+             // It's a closed loop physically
+             first.cin = last.cin; // Transfer cin from last to first
+             // The cout of the point BEFORE last is already set correctly.
+             points.pop();
+             bezierState.value.isClosing = true;
+        }
+    }
+
+    return points;
+}
+
 
 const pencilState = ref({
     isDrawing: false,
@@ -388,7 +541,7 @@ function renderLoop() {
         }
 
         // Draw Bezier Handles
-        if (activeTool.value === 'bezier' && bezierState.value.isDrawing) {
+        if (activeTool.value === 'bezier' && (bezierState.value.isDrawing || bezierState.value.isEditing)) {
             ctx.save();
             ctx.translate(viewport.value.x, viewport.value.y);
             ctx.scale(viewport.value.zoom, viewport.value.zoom);
@@ -396,8 +549,9 @@ function renderLoop() {
             const pts = bezierState.value.points;
             pts.forEach((pt, i) => {
                 const isLast = i === pts.length - 1;
-                // Don't draw handles for the "moving" point unless it's being dragged
-                if (isLast && !isDragging.value) {
+                
+                // Drawing Mode: moving point behavior
+                if (bezierState.value.isDrawing && isLast && !isDragging.value) {
                     // Just draw a small dot for the moving point
                     ctx.fillStyle = '#4facfe';
                     ctx.beginPath();
@@ -407,7 +561,7 @@ function renderLoop() {
                 }
 
                 // Draw Anchor
-                ctx.fillStyle = isLast ? '#ff4f4f' : '#4facfe';
+                ctx.fillStyle = (bezierState.value.isDrawing && isLast) ? '#ff4f4f' : '#4facfe';
                 ctx.strokeStyle = 'white';
                 ctx.lineWidth = 1 / viewport.value.zoom;
                 ctx.beginPath();
@@ -445,6 +599,60 @@ function renderLoop() {
                     ctx.fill();
                 }
             });
+            ctx.restore();
+        }
+
+        // Draw Gradient Controls
+        if (activeTool.value === 'gradient' && selectedObject.value && selectedObject.value.fill_gradient) {
+            const grad = selectedObject.value.fill_gradient;
+            ctx.save();
+            ctx.translate(viewport.value.x, viewport.value.y);
+            ctx.scale(viewport.value.zoom, viewport.value.zoom);
+
+            // Convert local gradient points to world
+            const p1 = localToWorld(selectedObject.value, grad.x1, grad.y1);
+            const p2 = localToWorld(selectedObject.value, grad.x2, grad.y2);
+
+            // Draw Line
+            ctx.beginPath();
+            ctx.moveTo(p1.x, p1.y);
+            ctx.lineTo(p2.x, p2.y);
+            ctx.strokeStyle = '#000000';
+            ctx.lineWidth = 2 / viewport.value.zoom;
+            ctx.stroke();
+            ctx.strokeStyle = '#ffffff';
+            ctx.lineWidth = 1 / viewport.value.zoom;
+            ctx.stroke();
+
+            // Draw Endpoints
+            [p1, p2].forEach((p) => {
+                ctx.beginPath();
+                ctx.arc(p.x, p.y, 6 / viewport.value.zoom, 0, Math.PI * 2);
+                ctx.fillStyle = '#ffffff';
+                ctx.fill();
+                ctx.strokeStyle = '#000000';
+                ctx.stroke();
+            });
+
+            // Draw Stops
+            if (grad.stops) {
+                grad.stops.forEach((stop: any, idx: number) => {
+                    const sx = p1.x + (p2.x - p1.x) * stop.offset;
+                    const sy = p1.y + (p2.y - p1.y) * stop.offset;
+                    
+                    ctx.beginPath();
+                    ctx.arc(sx, sy, 5 / viewport.value.zoom, 0, Math.PI * 2);
+                    ctx.fillStyle = stop.color;
+                    ctx.fill();
+                    ctx.strokeStyle = gradientState.value.activeStopIndex === idx ? '#ffff00' : '#ffffff';
+                    ctx.lineWidth = 2 / viewport.value.zoom;
+                    ctx.stroke();
+                    ctx.strokeStyle = '#000000';
+                    ctx.lineWidth = 1 / viewport.value.zoom;
+                    ctx.stroke();
+                });
+            }
+
             ctx.restore();
         }
 
@@ -495,13 +703,37 @@ function handleWheel(e: WheelEvent) {
     viewport.value.y -= e.deltaY;
   }
 
-  engine.value.set_viewport(viewport.value.x, viewport.value.y, viewport.value.zoom);
-  needsRender.value = true;
-}
-
-// Mouse Interactions
-function handleMouseDown(e: MouseEvent) {
-  if (!canvas.value || !engine.value) return;
+      engine.value.set_viewport(viewport.value.x, viewport.value.y, viewport.value.zoom);
+      needsRender.value = true;
+  }
+  
+  function hitTestBezierHandles(x: number, y: number): { index: number, type: 'anchor' | 'cin' | 'cout' } | null {
+      const pts = bezierState.value.points;
+      const hitDist = 8 / viewport.value.zoom;
+      
+      for (let i = 0; i < pts.length; i++) {
+          const pt = pts[i];
+          
+          // Check Anchor
+          if (Math.abs(x - pt.x) < hitDist && Math.abs(y - pt.y) < hitDist) {
+              return { index: i, type: 'anchor' };
+          }
+          
+          // Check Cout
+          if (Math.abs(x - pt.cout.x) < hitDist && Math.abs(y - pt.cout.y) < hitDist) {
+              return { index: i, type: 'cout' };
+          }
+          
+          // Check Cin
+          if (Math.abs(x - pt.cin.x) < hitDist && Math.abs(y - pt.cin.y) < hitDist) {
+              return { index: i, type: 'cin' };
+          }
+      }
+      return null;
+  }
+  
+  // Mouse Interactions
+  function handleMouseDown(e: MouseEvent) {  if (!canvas.value || !engine.value) return;
   const rect = canvas.value.getBoundingClientRect();
   const x = e.clientX - rect.left;
   const y = e.clientY - rect.top;
@@ -549,6 +781,75 @@ function handleMouseDown(e: MouseEvent) {
       return;
   }
 
+  if (activeTool.value === 'gradient') {
+      if (!selectedObject.value) {
+          const idsStr = engine.value.select_point(x, y, false);
+          selectedIds.value = JSON.parse(idsStr);
+          return;
+      }
+      
+      const obj = selectedObject.value;
+      if (!obj.fill_gradient) {
+          // If clicked on object, init gradient
+          const idsStr = engine.value.select_point(x, y, false);
+          const ids = JSON.parse(idsStr);
+          if (ids.includes(obj.id)) {
+               initGradient('fill');
+          }
+          return;
+      }
+
+      const grad = obj.fill_gradient;
+      const p1 = localToWorld(obj, grad.x1, grad.y1);
+      const p2 = localToWorld(obj, grad.x2, grad.y2);
+      const hitDist = 8 / viewport.value.zoom;
+
+      // Start/End
+      if (Math.hypot(worldPos.x - p1.x, worldPos.y - p1.y) < hitDist) {
+          gradientState.value = { isDragging: true, dragType: 'start', dragIndex: -1, activeStopIndex: -1 };
+          return;
+      }
+      if (Math.hypot(worldPos.x - p2.x, worldPos.y - p2.y) < hitDist) {
+          gradientState.value = { isDragging: true, dragType: 'end', dragIndex: -1, activeStopIndex: -1 };
+          return;
+      }
+
+      // Stops
+      if (grad.stops) {
+          for (let i = 0; i < grad.stops.length; i++) {
+              const stop = grad.stops[i];
+              const sx = p1.x + (p2.x - p1.x) * stop.offset;
+              const sy = p1.y + (p2.y - p1.y) * stop.offset;
+              if (Math.hypot(worldPos.x - sx, worldPos.y - sy) < hitDist) {
+                  gradientState.value = { isDragging: true, dragType: 'stop', dragIndex: i, activeStopIndex: i };
+                  return;
+              }
+          }
+      }
+
+      // Add Stop
+      const l2 = (p2.x - p1.x)**2 + (p2.y - p1.y)**2;
+      if (l2 > 0) {
+          const t = ((worldPos.x - p1.x) * (p2.x - p1.x) + (worldPos.y - p1.y) * (p2.y - p1.y)) / l2;
+          if (t >= 0 && t <= 1) {
+              const px = p1.x + t * (p2.x - p1.x);
+              const py = p1.y + t * (p2.y - p1.y);
+              if (Math.hypot(worldPos.x - px, worldPos.y - py) < hitDist) {
+                   const newStop = { offset: t, color: '#888888' };
+                   const newStops = [...(grad.stops || []), newStop].sort((a: any, b: any) => a.offset - b.offset);
+                   const newIdx = newStops.indexOf(newStop);
+                   updateGradient('fill', 'stops', newStops);
+                   gradientState.value = { isDragging: true, dragType: 'stop', dragIndex: newIdx, activeStopIndex: newIdx };
+                   return;
+              }
+          }
+      }
+      
+      const idsStr = engine.value.select_point(x, y, false);
+      selectedIds.value = JSON.parse(idsStr);
+      return;
+  }
+
   if (activeTool.value === 'zoom') {
       const zoomFactor = e.altKey ? 0.5 : 2.0;
       const newZoom = Math.max(0.1, Math.min(50, viewport.value.zoom * zoomFactor));
@@ -566,8 +867,35 @@ function handleMouseDown(e: MouseEvent) {
   }
 
   if (activeTool.value === 'bezier') {
-      if (!bezierState.value.isDrawing) {
-          // Start new path at 0,0 to avoid origin-shift jumps
+      const worldPos = screenToWorld(x, y);
+
+      // Check handle hit first if we have points
+      if (bezierState.value.points.length > 0) {
+           const hit = hitTestBezierHandles(worldPos.x, worldPos.y);
+           if (hit) {
+               bezierState.value.dragIndex = hit.index;
+               bezierState.value.dragType = hit.type;
+               isDragging.value = true;
+               return;
+           }
+      }
+
+      if (!bezierState.value.isDrawing && !bezierState.value.isEditing) {
+          // Check if we hit an EXISTING path object to start editing
+          const idsStr = engine.value.select_point(x, y, false);
+          const ids = JSON.parse(idsStr);
+          if (ids.length > 0) {
+               const obj = objects.value.find(o => o.id === ids[0]);
+               if (obj && obj.shape_type === 'Path') {
+                   bezierState.value.isEditing = true;
+                   bezierState.value.currentObjId = obj.id;
+                   bezierState.value.points = parsePathData(obj.path_data, obj.x, obj.y);
+                   executeCommand({ action: 'select', params: { id: obj.id } });
+                   return;
+               }
+          }
+          
+          // Start new path
            const res = executeCommand({
                 action: 'add',
                 params: { 
@@ -588,7 +916,7 @@ function handleMouseDown(e: MouseEvent) {
                 bezierState.value.mousePoint = { x: worldPos.x, y: worldPos.y };
                 engine.value.execute_command(JSON.stringify({ action: 'select', params: { id: res.id } }));
             }
-      } else {
+      } else if (bezierState.value.isDrawing) {
           // Check for Snap-Close
           let isClose = false;
           const startPt = bezierState.value.points[0];
@@ -598,12 +926,9 @@ function handleMouseDown(e: MouseEvent) {
           }
 
           if (isClose) {
-                // Instead of finishing immediately, we set isClosing to true.
-                // This allows the user to drag handles on the closing point in handleMouseMove.
                 bezierState.value.isClosing = true;
-                bezierState.value.mousePoint = null; // No rubber band needed while closing
+                bezierState.value.mousePoint = null; 
           } else {
-              // Commit the current point using world coordinates (relative to 0,0)
               bezierState.value.points.push({ 
                   x: worldPos.x, y: worldPos.y, 
                   cin: {x: worldPos.x, y: worldPos.y}, 
@@ -611,7 +936,6 @@ function handleMouseDown(e: MouseEvent) {
               });
               
               const pts = bezierState.value.points;
-              // No normalization while drawing
               const d = getPathString(pts, false, null, { x: 0, y: 0 });
               executeCommand({
                     action: 'update',
@@ -623,6 +947,12 @@ function handleMouseDown(e: MouseEvent) {
                     }
                 });
           }
+      } else if (bezierState.value.isEditing) {
+          // If in edit mode and didn't hit a handle, we exit edit mode
+          bezierState.value.isEditing = false;
+          bezierState.value.points = [];
+          bezierState.value.currentObjId = -1;
+          activeTool.value = 'select';
       }
       return;
   }
@@ -808,6 +1138,36 @@ function handleMouseMove(e: MouseEvent) {
       return;
   }
 
+  if (activeTool.value === 'gradient') {
+      canvas.value.style.cursor = 'default';
+      
+      if (gradientState.value.isDragging && selectedObject.value && selectedObject.value.fill_gradient) {
+          const obj = selectedObject.value;
+          const grad = obj.fill_gradient;
+          const type = gradientState.value.dragType;
+          
+          if (type === 'start') {
+              const localPt = worldToLocal(obj, worldPos.x, worldPos.y);
+              updateGradient('fill', 'x1', localPt.x);
+              updateGradient('fill', 'y1', localPt.y);
+          } else if (type === 'end') {
+              const localPt = worldToLocal(obj, worldPos.x, worldPos.y);
+              updateGradient('fill', 'x2', localPt.x);
+              updateGradient('fill', 'y2', localPt.y);
+          } else if (type === 'stop') {
+              const p1 = localToWorld(obj, grad.x1, grad.y1);
+              const p2 = localToWorld(obj, grad.x2, grad.y2);
+              const l2 = (p2.x - p1.x)**2 + (p2.y - p1.y)**2;
+              if (l2 > 0) {
+                  let t = ((worldPos.x - p1.x) * (p2.x - p1.x) + (worldPos.y - p1.y) * (p2.y - p1.y)) / l2;
+                  t = Math.max(0, Math.min(1, t));
+                  updateGradientStop('fill', gradientState.value.dragIndex, 'offset', t);
+              }
+          }
+          return;
+      }
+  }
+
   if (activeTool.value === 'zoom') {
       canvas.value.style.cursor = e.altKey ? 'zoom-out' : 'zoom-in';
   }
@@ -931,52 +1291,100 @@ function handleMouseMove(e: MouseEvent) {
     return;
   }
 
-  if (activeTool.value === 'bezier' && bezierState.value.isDrawing) {
+  if (activeTool.value === 'bezier') {
       const pts = bezierState.value.points;
       
-      // 1. Update mouse preview point
-      let targetX = worldPos.x;
-      let targetY = worldPos.y;
-      bezierState.value.isSnapped = false;
-
-      if (snapMode.value && pts.length > 0) {
-          const startPt = pts[0];
-          const dStart = Math.sqrt((worldPos.x - startPt.x)**2 + (worldPos.y - startPt.y)**2);
-          if (dStart < 15 / viewport.value.zoom) {
-              targetX = startPt.x;
-              targetY = startPt.y;
-              bezierState.value.isSnapped = true;
-          }
-      }
-      bezierState.value.mousePoint = { x: targetX, y: targetY };
-
-      // 2. If dragging, adjust handles
-      if (isDragging.value && pts.length > 0) {
-          const pt = bezierState.value.isClosing ? pts[0] : pts[pts.length - 1];
-          const dist = Math.sqrt((worldPos.x - pt.x)**2 + (worldPos.y - pt.y)**2);
-          if (dist > 2 / viewport.value.zoom) {
+      // EDIT MODE
+      if (bezierState.value.isEditing && isDragging.value && bezierState.value.dragIndex !== -1) {
+          const idx = bezierState.value.dragIndex;
+          const type = bezierState.value.dragType;
+          const pt = pts[idx];
+          
+          if (type === 'anchor') {
+              const dx = worldPos.x - pt.x;
+              const dy = worldPos.y - pt.y;
+              pt.x = worldPos.x;
+              pt.y = worldPos.y;
+              pt.cin.x += dx;
+              pt.cin.y += dy;
+              pt.cout.x += dx;
+              pt.cout.y += dy;
+          } else if (type === 'cin') {
+              pt.cin = { x: worldPos.x, y: worldPos.y };
+          } else if (type === 'cout') {
               pt.cout = { x: worldPos.x, y: worldPos.y };
-              pt.cin = { 
-                  x: pt.x - (worldPos.x - pt.x),
-                  y: pt.y - (worldPos.y - pt.y) 
-              };
           }
+          
+          let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+          pts.forEach(p => {
+              minX = Math.min(minX, p.x, p.cin.x, p.cout.x);
+              minY = Math.min(minY, p.y, p.cin.y, p.cout.y);
+              maxX = Math.max(maxX, p.x, p.cin.x, p.cout.x);
+              maxY = Math.max(maxY, p.y, p.cin.y, p.cout.y);
+          });
+          
+          const d = getPathString(pts, bezierState.value.isClosing, null, { x: minX, y: minY });
+          
+          executeCommand({
+              action: 'update',
+              params: {
+                  id: bezierState.value.currentObjId,
+                  path_data: d,
+                  x: minX,
+                  y: minY,
+                  width: Math.max(1, maxX - minX),
+                  height: Math.max(1, maxY - minY),
+                  save_undo: false
+              }
+          });
+          return;
       }
 
-      // 3. Update the path data in world space (0,0)
-      const d = getPathString(pts, bezierState.value.isClosing, bezierState.value.mousePoint, { x: 0, y: 0 });
-      executeCommand({
-            action: 'update',
-            params: { 
-                id: bezierState.value.currentObjId, 
-                path_data: d,
-                x: 0,
-                y: 0,
-                width: 0,
-                height: 0
+      if (bezierState.value.isDrawing) {
+        // 1. Update mouse preview point
+        let targetX = worldPos.x;
+        let targetY = worldPos.y;
+        bezierState.value.isSnapped = false;
+
+        if (snapMode.value && pts.length > 0) {
+            const startPt = pts[0];
+            const dStart = Math.sqrt((worldPos.x - startPt.x)**2 + (worldPos.y - startPt.y)**2);
+            if (dStart < 15 / viewport.value.zoom) {
+                targetX = startPt.x;
+                targetY = startPt.y;
+                bezierState.value.isSnapped = true;
             }
-        });
-      return;
+        }
+        bezierState.value.mousePoint = { x: targetX, y: targetY };
+
+        // 2. If dragging, adjust handles
+        if (isDragging.value && pts.length > 0) {
+            const pt = bezierState.value.isClosing ? pts[0] : pts[pts.length - 1];
+            const dist = Math.sqrt((worldPos.x - pt.x)**2 + (worldPos.y - pt.y)**2);
+            if (dist > 2 / viewport.value.zoom) {
+                pt.cout = { x: worldPos.x, y: worldPos.y };
+                pt.cin = { 
+                    x: pt.x - (worldPos.x - pt.x),
+                    y: pt.y - (worldPos.y - pt.y) 
+                };
+            }
+        }
+
+        // 3. Update the path data in world space (0,0)
+        const d = getPathString(pts, bezierState.value.isClosing, bezierState.value.mousePoint, { x: 0, y: 0 });
+        executeCommand({
+                action: 'update',
+                params: { 
+                    id: bezierState.value.currentObjId, 
+                    path_data: d,
+                    x: 0,
+                    y: 0,
+                    width: 0,
+                    height: 0
+                }
+            });
+        return;
+      }
   }
 
   if (activeTool.value === 'rotate' && isDragging.value && selectedObject.value) {
@@ -1034,12 +1442,16 @@ function handleMouseUp(e: MouseEvent) {
   }
 
   if (selectionBox.value) {
-      const { x, y, w, h } = selectionBox.value;
-      if (Math.abs(w) > 2 && Math.abs(h) > 2) {
-          const idsStr = engine.value?.select_rect(x, y, w, h, e.shiftKey || e.metaKey);
-          if (idsStr) selectedIds.value = JSON.parse(idsStr);
+      try {
+          const { x, y, w, h } = selectionBox.value;
+          if (Math.abs(w) > 2 && Math.abs(h) > 2) {
+              const idsStr = engine.value?.select_rect(x, y, w, h, e.shiftKey || e.metaKey);
+              if (idsStr) selectedIds.value = JSON.parse(idsStr);
+          }
+      } finally {
+          selectionBox.value = null;
+          needsRender.value = true;
       }
-      selectionBox.value = null;
       // We don't return here because we might need to reset tools or other cleanup
   }
 
@@ -1140,6 +1552,20 @@ function handleMouseUp(e: MouseEvent) {
       });
   }
 
+  if (activeTool.value === 'bezier' && bezierState.value.isEditing) {
+       if (bezierState.value.dragIndex !== -1) {
+           executeCommand({
+                action: 'update',
+                params: {
+                    id: bezierState.value.currentObjId,
+                    save_undo: true
+                }
+           });
+       }
+       bezierState.value.dragIndex = -1;
+       bezierState.value.dragType = null;
+  }
+
   if (activeTool.value === 'bezier' && bezierState.value.isDrawing && bezierState.value.isClosing) {
       // Finalize the closed path
       const pts = bezierState.value.points;
@@ -1205,6 +1631,27 @@ function handleMouseUp(e: MouseEvent) {
       activeTool.value = 'select';
   }
 
+  if (activeTool.value === 'gradient') {
+      if (gradientState.value.isDragging) {
+           if (gradientState.value.dragType === 'stop' && selectedObject.value) {
+               const grad = { ...selectedObject.value.fill_gradient };
+               grad.stops.sort((a: any, b: any) => a.offset - b.offset);
+               updateSelected('fill_gradient', grad, true);
+           } else if (selectedIds.value.length > 0) {
+               executeCommand({
+                    action: 'update',
+                    params: {
+                        id: selectedIds.value[0],
+                        save_undo: true
+                    }
+               });
+           }
+      }
+      gradientState.value.isDragging = false;
+      gradientState.value.dragIndex = -1;
+      gradientState.value.dragType = null;
+  }
+
   isDragging.value = false;
   initialObjectsState.value.clear();
   
@@ -1229,11 +1676,8 @@ async function sendMessage() {
     messages.value.splice(thinkingId, 1);
 
     for (const cmd of aiCommands) {
-      // Map AI commands to our unified action system
-      let action = cmd.command === 'add' ? 'add' : cmd.command === 'move' ? 'update' : cmd.command;
-      if (action === 'move') action = 'update';
-      
-      executeCommand({ action, params: cmd.params });
+      // Execute AI command directly
+      executeCommand({ action: cmd.action, params: cmd.params });
     }
 
     if (aiCommands.length > 0) {
@@ -1571,6 +2015,10 @@ function handleFileUpload(event: Event) {
 
         <button :class="{ active: activeTool === 'rotate' }" @click="activeTool = 'rotate'" title="Rotate Tool (R)">
           <RotateCw :size="18" />
+        </button>
+
+        <button :class="{ active: activeTool === 'gradient' }" @click="activeTool = 'gradient'" title="Gradient Tool (G)">
+          <PaintBucket :size="18" />
         </button>
 
         <button :class="{ active: activeTool === 'bezier' }" @click="activeTool = 'bezier'" title="Bezier Pen (P)">
@@ -2033,36 +2481,46 @@ function handleFileUpload(event: Event) {
 }
 
 .header {
-  height: 40px;
+  height: 48px;
   background: #252525;
   border-bottom: 1px solid #333;
   display: flex;
   align-items: center;
-  padding: 0 15px;
+  padding: 0 16px;
   justify-content: space-between;
 }
 
 .header-left {
   display: flex;
   align-items: center;
-  gap: 20px;
+  gap: 24px;
 }
 
 .menu-bar {
   display: flex;
-  gap: 4px;
+  gap: 2px;
+  align-items: center; /* Center items in the bar */
+  height: 100%;
 }
 
 .menu-item {
   position: relative;
-  font-size: 12px;
-  padding: 4px 8px;
+  font-size: 13px;
+  padding: 0 10px;
+  height: 32px; /* Fixed height for consistent centering */
+  display: flex;
+  align-items: center;
+  justify-content: center;
   cursor: pointer;
   border-radius: 4px;
+  color: #ccc;
+  transition: background 0.1s, color 0.1s;
+  line-height: 1;
 }
 
 .menu-item:hover {
   background: #333;
+  color: #fff;
 }
 
 .toggle-item:hover {
@@ -2072,9 +2530,14 @@ function handleFileUpload(event: Event) {
 .toggle-label {
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 8px;
     cursor: pointer;
     user-select: none;
+    color: #ccc;
+}
+
+.toggle-label:hover {
+    color: #fff;
 }
 
 .dropdown {
@@ -2086,9 +2549,10 @@ function handleFileUpload(event: Event) {
   border: 1px solid #444;
   box-shadow: 0 4px 12px rgba(0,0,0,0.5);
   z-index: 1000;
-  min-width: 160px;
-  border-radius: 4px;
-  padding: 4px 0;
+  min-width: 180px;
+  border-radius: 6px;
+  padding: 6px 0;
+  margin-top: 4px;
 }
 
 .menu-item:hover .dropdown {
@@ -2101,13 +2565,15 @@ function handleFileUpload(event: Event) {
   background: transparent;
   border: none;
   color: #eee;
-  padding: 6px 12px;
-  font-size: 12px;
+  padding: 8px 16px;
+  font-size: 13px;
   cursor: pointer;
+  transition: background 0.1s;
 }
 
 .dropdown button:hover:not(:disabled) {
   background: #4facfe;
+  color: white;
 }
 
 .dropdown button:disabled {
@@ -2118,22 +2584,28 @@ function handleFileUpload(event: Event) {
 .divider {
   height: 1px;
   background: #444;
-  margin: 4px 0;
+  margin: 6px 0;
 }
 
 .logo {
   font-weight: 800;
-  letter-spacing: 1px;
-  font-size: 14px;
+  letter-spacing: 0.5px;
+  font-size: 16px;
+  color: #fff;
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 
 .pro-tag {
   background: #4facfe;
   color: white;
-  font-size: 9px;
-  padding: 1px 4px;
-  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 5px;
+  border-radius: 4px;
   vertical-align: middle;
+  letter-spacing: 0.5px;
 }
 
 .ai-status-indicator {
@@ -2579,7 +3051,8 @@ canvas {
 .ai .msg-bubble { background: #2a2a2a; color: #a8ff78; border: 1px solid #333; }
 
 .chat-input {
-  padding: 10px;
+  padding: 12px;
+  background: #252525;
 }
 
 .chat-input input {
@@ -2587,9 +3060,16 @@ canvas {
   background: #1a1a1a;
   border: 1px solid #333;
   color: white;
-  padding: 8px 12px;
+  padding: 10px 12px;
+  border-radius: 6px;
+  box-sizing: border-box; /* Fix for overflow */
+  outline: none;
+  transition: border-color 0.2s;
 }
 
+.chat-input input:focus {
+    border-color: #4facfe;
+}
 .fill-control {
     display: flex;
     flex-direction: column;

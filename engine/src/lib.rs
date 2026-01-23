@@ -102,6 +102,40 @@ pub struct VectorObject {
     pub children: Option<Vec<VectorObject>>, // New: Grouping support
 }
 
+impl VectorObject {
+    fn get_world_bounds(&self) -> (f64, f64, f64, f64) {
+        let hw = self.width / 2.0;
+        let hh = self.height / 2.0;
+        let corners = [
+            (-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)
+        ];
+        
+        let cos_r = self.rotation.cos();
+        let sin_r = self.rotation.sin();
+        
+        let cx = self.x + hw;
+        let cy = self.y + hh;
+
+        let mut min_x = f64::INFINITY;
+        let mut min_y = f64::INFINITY;
+        let mut max_x = f64::NEG_INFINITY;
+        let mut max_y = f64::NEG_INFINITY;
+
+        for (px, py) in corners {
+            let rx = px * cos_r - py * sin_r;
+            let ry = px * sin_r + py * cos_r;
+            let wx = cx + rx;
+            let wy = cy + ry;
+            
+            if wx < min_x { min_x = wx; }
+            if wx > max_x { max_x = wx; }
+            if wy < min_y { min_y = wy; }
+            if wy > max_y { max_y = wy; }
+        }
+        (min_x, min_y, max_x, max_y)
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Artboard {
     pub width: f64,
@@ -1169,7 +1203,91 @@ impl VectorEngine {
             self.render_object(ctx, obj);
         }
         ctx.restore();
+        
+        // Render Selection Overlay
+        self.render_selection_overlay(ctx);
+
         ctx.restore();
+    }
+
+    fn render_selection_overlay(&self, ctx: &web_sys::CanvasRenderingContext2d) {
+        if self.selected_ids.is_empty() { return; }
+
+        if self.selected_ids.len() == 1 {
+             let id = self.selected_ids[0];
+             if let Some(obj) = self.objects.iter().find(|o| o.id == id) {
+                ctx.save();
+                ctx.translate(obj.x + obj.width / 2.0, obj.y + obj.height / 2.0).unwrap();
+                ctx.rotate(obj.rotation).unwrap();
+                ctx.translate(-obj.width / 2.0, -obj.height / 2.0).unwrap();
+
+                ctx.set_stroke_style(&JsValue::from_str("#4facfe"));
+                ctx.set_line_width(1.5 / self.viewport_zoom);
+                ctx.set_line_dash(&js_sys::Array::new()).unwrap(); 
+                ctx.stroke_rect(0.0, 0.0, obj.width, obj.height);
+
+                let handle_size = 8.0 / self.viewport_zoom;
+                let rotate_offset = -30.0 / self.viewport_zoom;
+                
+                ctx.set_fill_style(&JsValue::from_str("#ffffff"));
+                ctx.set_stroke_style(&JsValue::from_str("#4facfe"));
+                ctx.set_line_width(1.0 / self.viewport_zoom);
+
+                let handles = [
+                    (0.0, 0.0), (obj.width, 0.0), (0.0, obj.height), (obj.width, obj.height),
+                    (obj.width / 2.0, 0.0), (obj.width / 2.0, obj.height), 
+                    (0.0, obj.height / 2.0), (obj.width, obj.height / 2.0),
+                ];
+
+                for (hx, hy) in handles {
+                    ctx.begin_path();
+                    ctx.rect(hx - handle_size/2.0, hy - handle_size/2.0, handle_size, handle_size);
+                    ctx.fill();
+                    ctx.stroke();
+                }
+
+                ctx.begin_path();
+                ctx.move_to(obj.width / 2.0, 0.0);
+                ctx.line_to(obj.width / 2.0, rotate_offset);
+                ctx.stroke();
+
+                ctx.begin_path();
+                ctx.arc(obj.width / 2.0, rotate_offset, handle_size / 2.0, 0.0, std::f64::consts::PI * 2.0).unwrap();
+                ctx.fill();
+                ctx.stroke();
+                
+                ctx.restore();
+             }
+        } else {
+            // Group Selection
+            let mut g_min_x = f64::INFINITY;
+            let mut g_min_y = f64::INFINITY;
+            let mut g_max_x = f64::NEG_INFINITY;
+            let mut g_max_y = f64::NEG_INFINITY;
+
+            for id in &self.selected_ids {
+                if let Some(obj) = self.objects.iter().find(|o| o.id == *id) {
+                    let (min_x, min_y, max_x, max_y) = obj.get_world_bounds();
+                    if min_x < g_min_x { g_min_x = min_x; }
+                    if min_y < g_min_y { g_min_y = min_y; }
+                    if max_x > g_max_x { g_max_x = max_x; }
+                    if max_y > g_max_y { g_max_y = max_y; }
+                }
+            }
+
+            if g_min_x < g_max_x && g_min_y < g_max_y {
+                ctx.save();
+                ctx.set_stroke_style(&JsValue::from_str("#4facfe"));
+                ctx.set_line_width(1.5 / self.viewport_zoom);
+                let dash = js_sys::Array::new();
+                dash.push(&JsValue::from_f64(4.0 / self.viewport_zoom));
+                dash.push(&JsValue::from_f64(4.0 / self.viewport_zoom));
+                ctx.set_line_dash(&dash).unwrap();
+                
+                ctx.stroke_rect(g_min_x, g_min_y, g_max_x - g_min_x, g_max_y - g_min_y);
+                ctx.restore();
+            }
+        }
     }
 
     fn render_object(&self, ctx: &web_sys::CanvasRenderingContext2d, obj: &VectorObject) {
@@ -1327,48 +1445,6 @@ impl VectorEngine {
                     }
                 }
                 _ => {}
-            }
-        }
-
-        // Draw selection highlight (relative to object space)
-        if self.selected_ids.contains(&obj.id) {
-            ctx.set_stroke_style(&JsValue::from_str("#4facfe"));
-            ctx.set_line_width(1.5 / self.viewport_zoom);
-            ctx.set_line_dash(&js_sys::Array::new()).unwrap(); 
-            ctx.stroke_rect(0.0, 0.0, obj.width, obj.height);
-
-            // Only draw handles for the primary selection
-            if self.selected_ids.last() == Some(&obj.id) {
-                let handle_size = 8.0 / self.viewport_zoom;
-                let rotate_offset = -30.0 / self.viewport_zoom;
-                
-                ctx.set_fill_style(&JsValue::from_str("#ffffff"));
-                ctx.set_stroke_style(&JsValue::from_str("#4facfe"));
-                ctx.set_line_width(1.0 / self.viewport_zoom);
-
-                let handles = [
-                    (0.0, 0.0), (obj.width, 0.0), (0.0, obj.height), (obj.width, obj.height),
-                    (obj.width / 2.0, 0.0), (obj.width / 2.0, obj.height), 
-                    (0.0, obj.height / 2.0), (obj.width, obj.height / 2.0),
-                ];
-
-                for (hx, hy) in handles {
-                    ctx.begin_path();
-                    ctx.rect(hx - handle_size/2.0, hy - handle_size/2.0, handle_size, handle_size);
-                    ctx.fill();
-                    ctx.stroke();
-                }
-
-                // Rotation handle
-                ctx.begin_path();
-                ctx.move_to(obj.width / 2.0, 0.0);
-                ctx.line_to(obj.width / 2.0, rotate_offset);
-                ctx.stroke();
-
-                ctx.begin_path();
-                ctx.arc(obj.width / 2.0, rotate_offset, handle_size / 2.0, 0.0, std::f64::consts::PI * 2.0).unwrap();
-                ctx.fill();
-                ctx.stroke();
             }
         }
 
