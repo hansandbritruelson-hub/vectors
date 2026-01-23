@@ -4,7 +4,7 @@
   "description": "AI-assisted vector editor with Rust/WASM backend",
   "main": "electron/main.js",
   "scripts": {
-    "engine:build": "export RUSTUP_HOME=$PWD/.rustup_home && export CARGO_HOME=$PWD/.cargo_home && cd engine && cargo build --target wasm32-unknown-unknown --release && ../.cargo_home/bin/wasm-bindgen target/wasm32-unknown-unknown/release/engine.wasm --out-dir ../web/src/pkg --target web",
+    "engine:build": "./scripts/build-engine.sh",
     "web:install": "cd web && npm install",
     "web:dev": "cd web && npm run dev",
     "web:build": "npm run engine:build && cd web && npm run build",

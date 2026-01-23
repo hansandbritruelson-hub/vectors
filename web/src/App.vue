@@ -1148,12 +1148,12 @@ function handleMouseMove(e: MouseEvent) {
           
           if (type === 'start') {
               const localPt = worldToLocal(obj, worldPos.x, worldPos.y);
-              updateGradient('fill', 'x1', localPt.x);
-              updateGradient('fill', 'y1', localPt.y);
+              updateGradient('fill', 'x1', localPt.x, false);
+              updateGradient('fill', 'y1', localPt.y, false);
           } else if (type === 'end') {
               const localPt = worldToLocal(obj, worldPos.x, worldPos.y);
-              updateGradient('fill', 'x2', localPt.x);
-              updateGradient('fill', 'y2', localPt.y);
+              updateGradient('fill', 'x2', localPt.x, false);
+              updateGradient('fill', 'y2', localPt.y, false);
           } else if (type === 'stop') {
               const p1 = localToWorld(obj, grad.x1, grad.y1);
               const p2 = localToWorld(obj, grad.x2, grad.y2);
@@ -1161,7 +1161,7 @@ function handleMouseMove(e: MouseEvent) {
               if (l2 > 0) {
                   let t = ((worldPos.x - p1.x) * (p2.x - p1.x) + (worldPos.y - p1.y) * (p2.y - p1.y)) / l2;
                   t = Math.max(0, Math.min(1, t));
-                  updateGradientStop('fill', gradientState.value.dragIndex, 'offset', t);
+                  updateGradientStop('fill', gradientState.value.dragIndex, 'offset', t, false);
               }
           }
           return;
@@ -1705,20 +1705,20 @@ function initGradient(prop: 'fill' | 'stroke') {
     updateSelected(prop + '_gradient', defaultGradient);
 }
 
-function updateGradient(prop: 'fill' | 'stroke', key: string, value: any) {
+function updateGradient(prop: 'fill' | 'stroke', key: string, value: any, saveUndo: boolean = true) {
     if (!selectedObject.value) return;
     const grad = { ...selectedObject.value[prop + '_gradient'] };
     grad[key] = value;
-    updateSelected(prop + '_gradient', grad);
+    updateSelected(prop + '_gradient', grad, saveUndo);
 }
 
-function updateGradientStop(prop: 'fill' | 'stroke', idx: number, key: string, value: any) {
+function updateGradientStop(prop: 'fill' | 'stroke', idx: number, key: string, value: any, saveUndo: boolean = true) {
     if (!selectedObject.value) return;
     const grad = { ...selectedObject.value[prop + '_gradient'] };
     const stops = [...grad.stops];
     stops[idx] = { ...stops[idx], [key]: value };
     grad.stops = stops;
-    updateSelected(prop + '_gradient', grad);
+    updateSelected(prop + '_gradient', grad, saveUndo);
 }
 
 function addGradientStop(prop: 'fill' | 'stroke') {
