@@ -974,8 +974,56 @@ impl VectorEngine {
             if let Some(v) = params["sw"].as_f64() { obj.sw = v; }
             if let Some(v) = params["sh"].as_f64() { obj.sh = v; }
             if let Some(v) = params["rotation"].as_f64() { obj.rotation = v; }
-            if let Some(v) = params["fill"].as_str() { obj.fill = v.to_string(); }
-            if let Some(v) = params["stroke"].as_str() { obj.stroke = v.to_string(); }
+            if let Some(v) = params["fill"].as_str() { 
+                obj.fill = v.to_string(); 
+                obj.fill_gradient = None; // Reset gradient if solid color is set
+            }
+            if let Some(grad) = params["fill_gradient"].as_object() {
+                // Manually deserialize Gradient from JSON Value
+                let mut stops = Vec::new();
+                if let Some(arr) = grad.get("stops").and_then(|s| s.as_array()) {
+                    for s in arr {
+                        if let (Some(offset), Some(color)) = (s["offset"].as_f64(), s["color"].as_str()) {
+                            stops.push(GradientStop { offset, color: color.to_string() });
+                        }
+                    }
+                }
+                
+                obj.fill_gradient = Some(Gradient {
+                    is_radial: grad.get("is_radial").and_then(|v| v.as_bool()).unwrap_or(false),
+                    x1: grad.get("x1").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    y1: grad.get("y1").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    x2: grad.get("x2").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    y2: grad.get("y2").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    r1: grad.get("r1").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    r2: grad.get("r2").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    stops,
+                });
+            }
+            if let Some(v) = params["stroke"].as_str() { 
+                obj.stroke = v.to_string();
+                obj.stroke_gradient = None;
+            }
+            if let Some(grad) = params["stroke_gradient"].as_object() {
+                let mut stops = Vec::new();
+                if let Some(arr) = grad.get("stops").and_then(|s| s.as_array()) {
+                     for s in arr {
+                        if let (Some(offset), Some(color)) = (s["offset"].as_f64(), s["color"].as_str()) {
+                            stops.push(GradientStop { offset, color: color.to_string() });
+                        }
+                    }
+                }
+                 obj.stroke_gradient = Some(Gradient {
+                    is_radial: grad.get("is_radial").and_then(|v| v.as_bool()).unwrap_or(false),
+                    x1: grad.get("x1").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    y1: grad.get("y1").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    x2: grad.get("x2").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    y2: grad.get("y2").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    r1: grad.get("r1").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    r2: grad.get("r2").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    stops,
+                });
+            }
             if let Some(v) = params["stroke_width"].as_f64() { obj.stroke_width = v; }
             if let Some(v) = params["opacity"].as_f64() { obj.opacity = v; }
             if let Some(v) = params["visible"].as_bool() { obj.visible = v; }
