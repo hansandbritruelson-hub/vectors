@@ -5,12 +5,13 @@ import { aiService, type ModelStatus } from './ai';
 import LayerItem from './components/LayerItem.vue';
 import { 
     MousePointer2, Square, Circle, PenTool, Crop, 
-    Star, Hexagon, Pipette, Wand2, Type, Upload,
+    Star, Hexagon, Pipette, Type, Upload,
     Trash2, Copy, BringToFront, SendToBack, ChevronUp, ChevronDown,
-    Pencil, Eraser, Hand, Search, RotateCw, PaintBucket
+    Pencil, Eraser, Hand, Search, RotateCw, PaintBucket,
+    Zap
 } from 'lucide-vue-next';
 
-type Tool = 'select' | 'rect' | 'circle' | 'image' | 'bezier' | 'crop' | 'star' | 'poly' | 'eyedropper' | 'magic' | 'text' | 'pencil' | 'eraser' | 'hand' | 'zoom' | 'rotate' | 'gradient';
+type Tool = 'select' | 'rect' | 'circle' | 'image' | 'bezier' | 'crop' | 'star' | 'poly' | 'eyedropper' | 'text' | 'pencil' | 'eraser' | 'hand' | 'zoom' | 'rotate' | 'gradient' | 'vectorize';
 
 const canvas = ref<HTMLCanvasElement | null>(null);
 const canvasContainer = ref<HTMLElement | null>(null);
@@ -21,6 +22,24 @@ const messages = ref<{ role: string, content: string }[]>([]);
 const fileInput = ref<HTMLInputElement | null>(null);
 const openImageInput = ref<HTMLInputElement | null>(null);
 const aiStatus = ref<ModelStatus>({ status: 'idle', message: 'AI ready to load' });
+
+// Tooltip State
+const tooltip = ref({ show: false, text: '', x: 0, y: 0 });
+function showTooltip(e: MouseEvent, text: string) {
+    tooltip.value = {
+        show: true,
+        text,
+        x: e.clientX,
+        y: e.clientY
+    };
+}
+function moveTooltip(e: MouseEvent) {
+    tooltip.value.x = e.clientX;
+    tooltip.value.y = e.clientY;
+}
+function hideTooltip() {
+    tooltip.value.show = false;
+}
 
 // State
 const activeTool = ref<Tool>('select');
@@ -39,6 +58,17 @@ const needsRender = ref(true);
 const selectionBox = ref<{ x: number, y: number, w: number, h: number } | null>(null);
 const activeHandle = ref<{ id: number, type: string } | null>(null);
 
+
+watch(activeTool, () => {
+    needsRender.value = true;
+});
+
+watch(selectedIds, (newIds) => {
+    if (newIds.length === 0 && !['hand', 'zoom', 'vectorize'].includes(activeTool.value)) {
+        activeTool.value = 'select';
+    }
+    needsRender.value = true;
+}, { deep: true });
 
 watch(messages, () => {
     nextTick(() => {
@@ -70,6 +100,35 @@ const cropState = ref({
     currentX: 0,
     currentY: 0,
 });
+
+const vectorizeThreshold = ref(128);
+
+function vectorizeImage() {
+    console.log("Frontend: Requesting vectorization...");
+    const id = targetImageId.value;
+    if (id === -1) {
+        console.warn("Frontend: No image found for vectorization");
+        return;
+    }
+
+    const obj = objects.value.find(o => o.id === id);
+    if (!obj || obj.shape_type !== 'Image') {
+        console.warn("Frontend: Selected object is not an image");
+        return;
+    }
+
+    const res = executeCommand({
+        action: 'vectorize',
+        params: {
+            id: id,
+            threshold: vectorizeThreshold.value
+        }
+    });
+    console.log("Frontend: Vectorization result:", res);
+    if (res && res.id) {
+        executeCommand({ action: 'select', params: { id: res.id } });
+    }
+}
 
 const gradientState = ref({
     isDragging: false,
@@ -313,6 +372,28 @@ const targetImageId = computed(() => {
     return bottomImage ? bottomImage.id : -1;
 });
 
+const activeStopWorldPos = computed(() => {
+    if (activeTool.value !== 'gradient' || !selectedObject.value || !selectedObject.value.fill_gradient || gradientState.value.activeStopIndex === -1) {
+        return null;
+    }
+    const obj = selectedObject.value;
+    const grad = obj.fill_gradient;
+    const stop = grad.stops[gradientState.value.activeStopIndex];
+    if (!stop) return null;
+
+    const p1 = localToWorld(obj, grad.x1, grad.y1);
+    const p2 = localToWorld(obj, grad.x2, grad.y2);
+    
+    const wx = p1.x + (p2.x - p1.x) * stop.offset;
+    const wy = p1.y + (p2.y - p1.y) * stop.offset;
+
+    // Convert world to screen
+    return {
+        x: wx * viewport.value.zoom + viewport.value.x,
+        y: wy * viewport.value.zoom + viewport.value.y
+    };
+});
+
 async function removeSelectedBackground() {
     const id = targetImageId.value;
     if (id === -1) return;
@@ -335,11 +416,20 @@ async function removeSelectedBackground() {
 
         const resultBlob = await aiService.removeBackground(blob);
         const url = URL.createObjectURL(resultBlob);
+        
+        // Convert blob back to array buffer for engine
+        const resultBuffer = await resultBlob.arrayBuffer();
+        const resultBytes = new Uint8Array(resultBuffer);
+
         const newImg = new Image();
         newImg.onload = () => {
             if (engine.value) {
                 engine.value.set_image_object(id, newImg);
                 imageMap.set(id, newImg);
+                
+                // Update raw image data in engine efficiently
+                engine.value.set_image_raw(id, resultBytes);
+
                 needsRender.value = true;
                 executeCommand({ action: 'update', params: { id, save_undo: true } });
             }
@@ -378,17 +468,7 @@ onMounted(async () => {
         if (e.key.toLowerCase() === 'v') activeTool.value = 'select';
         if (e.key.toLowerCase() === 'm') activeTool.value = 'rect';
         if (e.key.toLowerCase() === 'r') activeTool.value = 'rotate';
-        if (e.key.toLowerCase() === 'o') activeTool.value = 'circle';
-        if (e.key.toLowerCase() === 's') activeTool.value = 'star';
-        if (e.key.toLowerCase() === 'g') activeTool.value = 'poly';
-        if (e.key.toLowerCase() === 'p') activeTool.value = 'bezier';
-        if (e.key.toLowerCase() === 'n') activeTool.value = 'pencil';
-        if (e.key.toLowerCase() === 'e') activeTool.value = 'eraser';
-        if (e.key.toLowerCase() === 'h') activeTool.value = 'hand';
-        if (e.key.toLowerCase() === 'z') activeTool.value = 'zoom';
-        if (e.key.toLowerCase() === 'i') activeTool.value = 'eyedropper';
-        if (e.key.toLowerCase() === 'm') activeTool.value = 'magic';
-        if (e.key.toLowerCase() === 't') activeTool.value = 'text';
+        if (e.key.toLowerCase() === 'q') activeTool.value = 'vectorize';
         if (e.key.toLowerCase() === 'c' && hasImage.value) activeTool.value = 'crop';
         if (e.key === 'Backspace' || e.key === 'Delete') deleteSelected();
 
@@ -667,11 +747,21 @@ function renderLoop() {
   requestAnimationFrame(renderLoop);
 }
 
+function syncState() {
+  if (!engine.value) return;
+  const json = engine.value.get_objects_json();
+  objects.value = JSON.parse(json);
+  const selIdsJson = engine.value.get_selected_ids();
+  selectedIds.value = JSON.parse(selIdsJson);
+}
+
 function executeCommand(cmd: any) {
   if (!engine.value) return;
+  console.log("Frontend: executeCommand", cmd);
   const result = engine.value.execute_command(JSON.stringify(cmd));
   const parsed = JSON.parse(result);
   if (parsed.error) console.error("Command Error:", parsed.error);
+  syncState();
   needsRender.value = true;
   return parsed;
 }
@@ -733,7 +823,9 @@ function handleWheel(e: WheelEvent) {
   }
   
   // Mouse Interactions
-  function handleMouseDown(e: MouseEvent) {  if (!canvas.value || !engine.value) return;
+  function handleMouseDown(e: MouseEvent) {
+  console.log("handleMouseDown", activeTool.value);
+  if (!canvas.value || !engine.value) return;
   const rect = canvas.value.getBoundingClientRect();
   const x = e.clientX - rect.left;
   const y = e.clientY - rect.top;
@@ -773,7 +865,7 @@ function handleWheel(e: WheelEvent) {
   }
 
   if (activeTool.value === 'eraser') {
-      const idsStr = engine.value.select_point(x, y, false);
+      const idsStr = engine.value.select_point(x, y, false, true);
       const ids = JSON.parse(idsStr);
       if (ids.length > 0) {
           executeCommand({ action: 'delete', params: { ids } });
@@ -782,71 +874,96 @@ function handleWheel(e: WheelEvent) {
   }
 
   if (activeTool.value === 'gradient') {
-      if (!selectedObject.value) {
-          const idsStr = engine.value.select_point(x, y, false);
-          selectedIds.value = JSON.parse(idsStr);
+      const worldPos = screenToWorld(x, y);
+      let obj = selectedObject.value;
+      
+      // 1. If nothing is selected, try to select something
+      if (!obj) {
+          const resIds = JSON.parse(engine.value.select_point(x, y, false, false));
+          selectedIds.value = resIds;
+          syncState();
+          obj = selectedObject.value;
+      }
+
+      if (!obj) {
+          isDragging.value = false;
+          gradientState.value.activeStopIndex = -1;
+          activeTool.value = 'select';
           return;
       }
       
-      const obj = selectedObject.value;
-      if (!obj.fill_gradient) {
-          // If clicked on object, init gradient
-          const idsStr = engine.value.select_point(x, y, false);
-          const ids = JSON.parse(idsStr);
-          if (ids.includes(obj.id)) {
-               initGradient('fill');
+      // 2. Check if we hit existing controls first (stops or handles)
+      if (obj.fill_gradient) {
+          const grad = obj.fill_gradient;
+          const p1 = localToWorld(obj, grad.x1, grad.y1);
+          const p2 = localToWorld(obj, grad.x2, grad.y2);
+          const hitDist = 12 / viewport.value.zoom;
+
+          // Hit start handle
+          if (Math.hypot(worldPos.x - p1.x, worldPos.y - p1.y) < hitDist) {
+              isDragging.value = true;
+              gradientState.value = { isDragging: true, dragType: 'start', dragIndex: -1, activeStopIndex: -1 };
+              return;
           }
-          return;
-      }
-
-      const grad = obj.fill_gradient;
-      const p1 = localToWorld(obj, grad.x1, grad.y1);
-      const p2 = localToWorld(obj, grad.x2, grad.y2);
-      const hitDist = 8 / viewport.value.zoom;
-
-      // Start/End
-      if (Math.hypot(worldPos.x - p1.x, worldPos.y - p1.y) < hitDist) {
-          gradientState.value = { isDragging: true, dragType: 'start', dragIndex: -1, activeStopIndex: -1 };
-          return;
-      }
-      if (Math.hypot(worldPos.x - p2.x, worldPos.y - p2.y) < hitDist) {
-          gradientState.value = { isDragging: true, dragType: 'end', dragIndex: -1, activeStopIndex: -1 };
-          return;
-      }
-
-      // Stops
-      if (grad.stops) {
-          for (let i = 0; i < grad.stops.length; i++) {
-              const stop = grad.stops[i];
-              const sx = p1.x + (p2.x - p1.x) * stop.offset;
-              const sy = p1.y + (p2.y - p1.y) * stop.offset;
-              if (Math.hypot(worldPos.x - sx, worldPos.y - sy) < hitDist) {
-                  gradientState.value = { isDragging: true, dragType: 'stop', dragIndex: i, activeStopIndex: i };
-                  return;
+          // Hit end handle
+          if (Math.hypot(worldPos.x - p2.x, worldPos.y - p2.y) < hitDist) {
+              isDragging.value = true;
+              gradientState.value = { isDragging: true, dragType: 'end', dragIndex: -1, activeStopIndex: -1 };
+              return;
+          }
+          // Hit stops
+          if (grad.stops) {
+              for (let i = 0; i < grad.stops.length; i++) {
+                  const stop = grad.stops[i];
+                  const sx = p1.x + (p2.x - p1.x) * stop.offset;
+                  const sy = p1.y + (p2.y - p1.y) * stop.offset;
+                  if (Math.hypot(worldPos.x - sx, worldPos.y - sy) < hitDist) {
+                      isDragging.value = true;
+                      gradientState.value = { isDragging: true, dragType: 'stop', dragIndex: i, activeStopIndex: i };
+                      
+                      // Immediate color picker trigger
+                      nextTick(() => {
+                          const input = document.querySelector('.floating-color-picker input') as HTMLInputElement;
+                          input?.click();
+                      });
+                      return;
+                  }
+              }
+          }
+          // Hit line to add stop
+          const l2 = (p2.x - p1.x)**2 + (p2.y - p1.y)**2;
+          if (l2 > 0) {
+              const t = ((worldPos.x - p1.x) * (p2.x - p1.x) + (worldPos.y - p1.y) * (p2.y - p1.y)) / l2;
+              if (t >= 0 && t <= 1) {
+                  const px = p1.x + t * (p2.x - p1.x);
+                  const py = p1.y + t * (p2.y - p1.y);
+                  if (Math.hypot(worldPos.x - px, worldPos.y - py) < hitDist) {
+                       const newStop = { offset: t, color: '#888888' };
+                       const newStops = [...(grad.stops || []), newStop].sort((a: any, b: any) => a.offset - b.offset);
+                       const newIdx = newStops.indexOf(newStop);
+                       updateGradient('fill', 'stops', newStops);
+                       isDragging.value = true;
+                       gradientState.value = { isDragging: true, dragType: 'stop', dragIndex: newIdx, activeStopIndex: newIdx };
+                       
+                       nextTick(() => {
+                           const input = document.querySelector('.floating-color-picker input') as HTMLInputElement;
+                           input?.click();
+                       });
+                       return;
+                  }
               }
           }
       }
 
-      // Add Stop
-      const l2 = (p2.x - p1.x)**2 + (p2.y - p1.y)**2;
-      if (l2 > 0) {
-          const t = ((worldPos.x - p1.x) * (p2.x - p1.x) + (worldPos.y - p1.y) * (p2.y - p1.y)) / l2;
-          if (t >= 0 && t <= 1) {
-              const px = p1.x + t * (p2.x - p1.x);
-              const py = p1.y + t * (p2.y - p1.y);
-              if (Math.hypot(worldPos.x - px, worldPos.y - py) < hitDist) {
-                   const newStop = { offset: t, color: '#888888' };
-                   const newStops = [...(grad.stops || []), newStop].sort((a: any, b: any) => a.offset - b.offset);
-                   const newIdx = newStops.indexOf(newStop);
-                   updateGradient('fill', 'stops', newStops);
-                   gradientState.value = { isDragging: true, dragType: 'stop', dragIndex: newIdx, activeStopIndex: newIdx };
-                   return;
-              }
-          }
-      }
-      
-      const idsStr = engine.value.select_point(x, y, false);
-      selectedIds.value = JSON.parse(idsStr);
+      // 3. If we didn't hit anything specifically, we enter PENDING REDRAW mode
+      // It will only start redrawing if the user actually moves the mouse (drag)
+      isDragging.value = true;
+      gradientState.value = { 
+          isDragging: true, 
+          dragType: 'redraw_pending' as any, 
+          dragIndex: -1, 
+          activeStopIndex: -1 
+      };
       return;
   }
 
@@ -882,7 +999,7 @@ function handleWheel(e: WheelEvent) {
 
       if (!bezierState.value.isDrawing && !bezierState.value.isEditing) {
           // Check if we hit an EXISTING path object to start editing
-          const idsStr = engine.value.select_point(x, y, false);
+          const idsStr = engine.value.select_point(x, y, false, false);
           const ids = JSON.parse(idsStr);
           if (ids.length > 0) {
                const obj = objects.value.find(o => o.id === ids[0]);
@@ -976,7 +1093,7 @@ function handleWheel(e: WheelEvent) {
     }
 
     // 1. Perform selection
-    const idsStr = engine.value.select_point(x, y, e.shiftKey || e.metaKey);
+    const idsStr = engine.value.select_point(x, y, e.shiftKey || e.metaKey, false);
     selectedIds.value = JSON.parse(idsStr);
 
     // 2. Check if we are dragging a selected object
@@ -1058,23 +1175,25 @@ function handleWheel(e: WheelEvent) {
               updateSelected('fill', hex);
           }
       }
-  } else if (activeTool.value === 'magic') {
-      // Magic tool selects and asks AI to "do something" with this area
-      engine.value.select_point(x, y, false);
-      const sid = engine.value.get_selected_ids(); // returns JSON string
-      const ids = JSON.parse(sid);
+  } else if (activeTool.value === 'vectorize') {
+      console.log("Vectorize tool: click at", x, y);
+      const idsStr = engine.value.select_point(x, y, false, true);
+      const ids = JSON.parse(idsStr);
+      console.log("Vectorize tool: hit ids", ids);
       if (ids.length > 0) {
-          chatInput.value = "Improve this object";
-          sendMessage();
-      } else {
-          chatInput.value = "Add something interesting here";
-          sendMessage();
+          selectedIds.value = ids;
+          syncState();
       }
+      // Always try to vectorize what we have (or the background image as fallback)
+      nextTick(() => {
+          vectorizeImage();
+      });
   }
 }
 
 function handleMouseMove(e: MouseEvent) {
   if (!canvas.value || !engine.value) return;
+  // console.log("handleMouseMove", activeTool.value, isDragging.value); // Too spammy
   const rect = canvas.value.getBoundingClientRect();
   const x = e.clientX - rect.left;
   const y = e.clientY - rect.top;
@@ -1106,8 +1225,25 @@ function handleMouseMove(e: MouseEvent) {
 
   const worldPos = screenToWorld(x, y);
 
-  if (activeTool.value === 'pencil') {
+  // Set Cursor
+  if (isPanning.value || activeTool.value === 'hand') {
+      canvas.value.style.cursor = isPanning.value ? 'grabbing' : 'grab';
+  } else if (activeTool.value === 'pencil' || activeTool.value === 'bezier' || activeTool.value === 'vectorize' || activeTool.value === 'eraser') {
       canvas.value.style.cursor = 'crosshair';
+      if (activeTool.value === 'bezier' && bezierState.value.isDrawing && !isDragging.value && snapMode.value && bezierState.value.points.length > 2) {
+          const startPt = bezierState.value.points[0];
+          const dist = Math.sqrt((worldPos.x - startPt.x)**2 + (worldPos.y - startPt.y)**2);
+          if (dist < 15 / viewport.value.zoom) {
+              canvas.value.style.cursor = 'pointer';
+          }
+      }
+  } else if (activeTool.value === 'zoom') {
+      canvas.value.style.cursor = e.altKey ? 'zoom-out' : 'zoom-in';
+  } else {
+      canvas.value.style.cursor = 'default';
+  }
+
+  if (activeTool.value === 'pencil') {
       if (pencilState.value.isDrawing) {
           const lastPt = pencilState.value.points[pencilState.value.points.length - 1];
           const dist = Math.sqrt((worldPos.x - lastPt.x)**2 + (worldPos.y - lastPt.y)**2);
@@ -1129,8 +1265,7 @@ function handleMouseMove(e: MouseEvent) {
   }
 
   if (activeTool.value === 'eraser' && isDragging.value) {
-      canvas.value.style.cursor = 'crosshair'; // Or an eraser-like cursor
-      const idsStr = engine.value.select_point(x, y, false);
+      const idsStr = engine.value.select_point(x, y, false, true);
       const ids = JSON.parse(idsStr);
       if (ids.length > 0) {
           executeCommand({ action: 'delete', params: { ids } });
@@ -1139,21 +1274,41 @@ function handleMouseMove(e: MouseEvent) {
   }
 
   if (activeTool.value === 'gradient') {
-      canvas.value.style.cursor = 'default';
-      
-      if (gradientState.value.isDragging && selectedObject.value && selectedObject.value.fill_gradient) {
+      if (gradientState.value.isDragging && selectedObject.value) {
           const obj = selectedObject.value;
           const grad = obj.fill_gradient;
           const type = gradientState.value.dragType;
           
+          if (type === 'redraw_pending' as any) {
+              const startWorld = screenToWorld(dragStart.value.x, dragStart.value.y);
+              const dist = Math.hypot(worldPos.x - startWorld.x, worldPos.y - startWorld.y);
+              if (dist > 5 / viewport.value.zoom) {
+                  // Transition to end-drag mode
+                  gradientState.value.dragType = 'end';
+                  const localStart = worldToLocal(obj, startWorld.x, startWorld.y);
+                  const defaultStops = obj.fill_gradient?.stops || [
+                      { offset: 0, color: '#ffffff' },
+                      { offset: 1, color: '#000000' }
+                  ];
+                  updateSelected('fill_gradient', {
+                      is_radial: false,
+                      x1: localStart.x, y1: localStart.y,
+                      x2: localStart.x, y2: localStart.y,
+                      r1: 0, r2: 50,
+                      stops: defaultStops
+                  }, false);
+              }
+              return;
+          }
+
+          if (!grad) return;
+
           if (type === 'start') {
               const localPt = worldToLocal(obj, worldPos.x, worldPos.y);
-              updateGradient('fill', 'x1', localPt.x, false);
-              updateGradient('fill', 'y1', localPt.y, false);
+              updateSelected('fill_gradient', { ...grad, x1: localPt.x, y1: localPt.y }, false);
           } else if (type === 'end') {
               const localPt = worldToLocal(obj, worldPos.x, worldPos.y);
-              updateGradient('fill', 'x2', localPt.x, false);
-              updateGradient('fill', 'y2', localPt.y, false);
+              updateSelected('fill_gradient', { ...grad, x2: localPt.x, y2: localPt.y }, false);
           } else if (type === 'stop') {
               const p1 = localToWorld(obj, grad.x1, grad.y1);
               const p2 = localToWorld(obj, grad.x2, grad.y2);
@@ -1168,23 +1323,6 @@ function handleMouseMove(e: MouseEvent) {
       }
   }
 
-  if (activeTool.value === 'zoom') {
-      canvas.value.style.cursor = e.altKey ? 'zoom-out' : 'zoom-in';
-  }
-
-  if (activeTool.value === 'bezier') {
-      canvas.value.style.cursor = 'crosshair';
-      if (bezierState.value.isDrawing && !isDragging.value && snapMode.value && bezierState.value.points.length > 2) {
-          const startPt = bezierState.value.points[0];
-          const dist = Math.sqrt((worldPos.x - startPt.x)**2 + (worldPos.y - startPt.y)**2);
-          if (dist < 15 / viewport.value.zoom) {
-              canvas.value.style.cursor = 'pointer';
-          }
-      }
-  } else {
-      canvas.value.style.cursor = 'default';
-  }
-  
   if (!isDragging.value && !cropState.value.isCropping && !activeHandle.value) return;
   
   if (activeHandle.value && selectedObject.value) {
@@ -1445,7 +1583,7 @@ function handleMouseUp(e: MouseEvent) {
       try {
           const { x, y, w, h } = selectionBox.value;
           if (Math.abs(w) > 2 && Math.abs(h) > 2) {
-              const idsStr = engine.value?.select_rect(x, y, w, h, e.shiftKey || e.metaKey);
+              const idsStr = engine.value?.select_rect(x, y, w, h, e.shiftKey || e.metaKey, false);
               if (idsStr) selectedIds.value = JSON.parse(idsStr);
           }
       } finally {
@@ -1655,7 +1793,7 @@ function handleMouseUp(e: MouseEvent) {
   isDragging.value = false;
   initialObjectsState.value.clear();
   
-  if (!['select', 'bezier', 'pencil', 'eraser', 'hand', 'zoom', 'rotate'].includes(activeTool.value)) {
+  if (!['select', 'bezier', 'pencil', 'eraser', 'hand', 'zoom', 'rotate', 'gradient', 'vectorize'].includes(activeTool.value)) {
       activeTool.value = 'select';
   }
 }
@@ -1768,6 +1906,11 @@ function handleOpenImage(event: Event) {
 
   const reader = new FileReader();
   reader.onload = (e) => {
+    const result = e.target?.result as ArrayBuffer;
+    const bytes = new Uint8Array(result);
+    const blob = new Blob([bytes]);
+    const url = URL.createObjectURL(blob);
+
     const img = new Image();
     img.onload = () => {
       if (engine.value) {
@@ -1813,6 +1956,10 @@ function handleOpenImage(event: Event) {
         if (res && res.id) {
             engine.value.set_image_object(res.id, img);
             imageMap.set(res.id, img);
+            
+            // Send raw bytes to engine efficiently
+            engine.value.set_image_raw(res.id, bytes);
+
             // Move to bottom and lock
             executeCommand({ action: 'move_to_back', params: { id: res.id } });
             executeCommand({ action: 'update', params: { id: res.id, locked: true } });
@@ -1820,9 +1967,9 @@ function handleOpenImage(event: Event) {
         }
       }
     };
-    img.src = e.target?.result as string;
+    img.src = url;
   };
-  reader.readAsDataURL(file);
+  reader.readAsArrayBuffer(file);
 }
 
 function exportArtboard() {
@@ -1899,8 +2046,13 @@ function handleFileUpload(event: Event) {
       reader.readAsArrayBuffer(file);
   } else {
       // Assume Image
-      const reader = new FileReader();
-      reader.onload = (e) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+        const result = e.target?.result as ArrayBuffer;
+        const bytes = new Uint8Array(result);
+        const blob = new Blob([bytes]);
+        const url = URL.createObjectURL(blob);
+        
         const img = new Image();
         img.onload = () => {
           if (engine.value) {
@@ -1920,15 +2072,19 @@ function handleFileUpload(event: Event) {
             if (res && res.id) {
                 engine.value.set_image_object(res.id, img);
                 imageMap.set(res.id, img);
+                
+                // Send raw bytes to engine efficiently
+                engine.value.set_image_raw(res.id, bytes);
+
                 // Ensure it's on top
                 executeCommand({ action: 'move_to_front', params: { id: res.id } });
                 needsRender.value = true;
             }
           }
         };
-        img.src = e.target?.result as string;
-      };
-      reader.readAsDataURL(file);
+        img.src = url;
+    };
+    reader.readAsArrayBuffer(file);
   }
 }
 </script>
@@ -1969,8 +2125,11 @@ function handleFileUpload(event: Event) {
             </label>
           </div>
           <div class="menu-item" v-if="targetImageId !== -1">
-            <button @click="removeSelectedBackground" class="ai-bg-btn">
+            <button @click="removeSelectedBackground" class="ai-bg-btn" style="margin-right: 8px;">
                 ✨ Remove BG
+            </button>
+            <button @click="vectorizeImage" class="ai-bg-btn" style="background: #4facfe;">
+                ✨ Vectorize
             </button>
           </div>
         </div>
@@ -1989,83 +2148,114 @@ function handleFileUpload(event: Event) {
     <div class="main-layout">
       <!-- Left Toolbar -->
       <aside class="toolbar-side">
-        <button :class="{ active: activeTool === 'select' }" @click="activeTool = 'select'" title="Select (V)">
+        <button :class="{ active: activeTool === 'select' }" @click="activeTool = 'select'" 
+                @mouseenter="showTooltip($event, 'Select (V)')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
           <MousePointer2 :size="18" />
         </button>
 
         <div class="tool-group" @mouseenter="showShapesMenu = true" @mouseleave="showShapesMenu = false">
-            <button :class="{ active: ['rect', 'circle', 'star', 'poly'].includes(activeTool) }" title="Shapes">
+            <button :class="{ active: ['rect', 'circle', 'star', 'poly'].includes(activeTool) }"
+                    @mouseenter="showTooltip($event, 'Shapes')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
                 <component :is="activeTool === 'circle' ? Circle : activeTool === 'star' ? Star : activeTool === 'poly' ? Hexagon : Square" :size="18" />
             </button>
             <div v-if="showShapesMenu" class="tool-flyout">
-                <button :class="{ active: activeTool === 'rect' }" @click="activeTool = 'rect'" title="Rectangle (M)">
+                <button :class="{ active: activeTool === 'rect' }" @click="activeTool = 'rect'" 
+                        @mouseenter="showTooltip($event, 'Rectangle (M)')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
                     <Square :size="18" />
                 </button>
-                <button :class="{ active: activeTool === 'circle' }" @click="activeTool = 'circle'" title="Circle (O)">
+                <button :class="{ active: activeTool === 'circle' }" @click="activeTool = 'circle'" 
+                        @mouseenter="showTooltip($event, 'Circle (O)')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
                     <Circle :size="18" />
                 </button>
-                <button :class="{ active: activeTool === 'star' }" @click="activeTool = 'star'" title="Star (S)">
+                <button :class="{ active: activeTool === 'star' }" @click="activeTool = 'star'" 
+                        @mouseenter="showTooltip($event, 'Star (S)')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
                     <Star :size="18" />
                 </button>
-                <button :class="{ active: activeTool === 'poly' }" @click="activeTool = 'poly'" title="Polygon (G)">
+                <button :class="{ active: activeTool === 'poly' }" @click="activeTool = 'poly'" 
+                        @mouseenter="showTooltip($event, 'Polygon (G)')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
                     <Hexagon :size="18" />
                 </button>
             </div>
         </div>
 
-        <button :class="{ active: activeTool === 'rotate' }" @click="activeTool = 'rotate'" title="Rotate Tool (R)">
-          <RotateCw :size="18" />
-        </button>
-
-        <button :class="{ active: activeTool === 'gradient' }" @click="activeTool = 'gradient'" title="Gradient Tool (G)">
-          <PaintBucket :size="18" />
-        </button>
-
-        <button :class="{ active: activeTool === 'bezier' }" @click="activeTool = 'bezier'" title="Bezier Pen (P)">
+        <button :class="{ active: activeTool === 'bezier' }" @click="activeTool = 'bezier'" 
+                @mouseenter="showTooltip($event, 'Bezier Pen (P)')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
           <PenTool :size="18" />
         </button>
-        <button :class="{ active: activeTool === 'pencil' }" @click="activeTool = 'pencil'" title="Pencil (N)">
+        <button :class="{ active: activeTool === 'pencil' }" @click="activeTool = 'pencil'" 
+                @mouseenter="showTooltip($event, 'Pencil (N)')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
           <Pencil :size="18" />
         </button>
-        <button :class="{ active: activeTool === 'eraser' }" @click="activeTool = 'eraser'" title="Eraser (E)">
+        <button :class="{ active: activeTool === 'eraser' }" @click="activeTool = 'eraser'" 
+                @mouseenter="showTooltip($event, 'Eraser (E)')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
           <Eraser :size="18" />
         </button>
-        <button :class="{ active: activeTool === 'text' }" @click="activeTool = 'text'" title="Text Tool (T)">
+        <button :class="{ active: activeTool === 'text' }" @click="activeTool = 'text'" 
+                @mouseenter="showTooltip($event, 'Text Tool (T)')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
           <Type :size="18" />
         </button>
-        <button :class="{ active: activeTool === 'eyedropper' }" @click="activeTool = 'eyedropper'" title="Eyedropper (I)">
+        <button :class="{ active: activeTool === 'eyedropper' }" @click="activeTool = 'eyedropper'" 
+                @mouseenter="showTooltip($event, 'Eyedropper (I)')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
           <Pipette :size="18" />
         </button>
-        <button :class="{ active: activeTool === 'magic' }" @click="activeTool = 'magic'" title="Magic AI (M)">
-          <Wand2 :size="18" />
+        <button :class="{ active: activeTool === 'vectorize' }" @click="activeTool = 'vectorize'" 
+                @mouseenter="showTooltip($event, 'Vectorize Image (Q)')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
+          <Zap :size="18" />
         </button>
-        <button :class="{ active: activeTool === 'crop' }" @click="activeTool = 'crop'" title="Crop Artboard (C)">
+        <button :class="{ active: activeTool === 'crop' }" @click="activeTool = 'crop'" 
+                @mouseenter="showTooltip($event, 'Crop Artboard (C)')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
           <Crop :size="18" />
         </button>
-        <button :class="{ active: activeTool === 'hand' }" @click="activeTool = 'hand'" title="Hand Tool (H)">
+        <button :class="{ active: activeTool === 'hand' }" @click="activeTool = 'hand'" 
+                @mouseenter="showTooltip($event, 'Hand Tool (H)')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
           <Hand :size="18" />
         </button>
-        <button :class="{ active: activeTool === 'zoom' }" @click="activeTool = 'zoom'" title="Zoom Tool (Z)">
+        <button :class="{ active: activeTool === 'zoom' }" @click="activeTool = 'zoom'" 
+                @mouseenter="showTooltip($event, 'Zoom Tool (Z)')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
           <Search :size="18" />
         </button>
         <div class="separator"></div>
-        <button @click="fileInput?.click()" title="Import Image or Document">
+        <button @click="fileInput?.click()" 
+                @mouseenter="showTooltip($event, 'Import Image or Document')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
           <Upload :size="18" />
         </button>
         <input type="file" @change="handleFileUpload" accept="image/*,.ai,.psd" ref="fileInput" style="display: none" />
         <input type="file" @change="handleOpenImage" accept="image/*" ref="openImageInput" style="display: none" />
       </aside>
 
-      <!-- Canvas Area -->
-      <main class="canvas-area" ref="canvasContainer">
-        <canvas 
-          ref="canvas" 
-          @mousedown="handleMouseDown"
-          @mousemove="handleMouseMove"
-          @mouseup="handleMouseUp"
-          @mouseleave="handleMouseUp"
-          @wheel.prevent="handleWheel"
-        ></canvas>
+      <div class="workspace-area">
+        <div class="top-context-bar">
+          <template v-if="selectedIds.length > 0">
+            <button :class="{ active: activeTool === 'rotate' }" @click="activeTool = 'rotate'" 
+                    @mouseenter="showTooltip($event, 'Rotate Tool (R)')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
+              <RotateCw :size="18" />
+            </button>
+            <button :class="{ active: activeTool === 'gradient' }" @click="activeTool = 'gradient'" 
+                    @mouseenter="showTooltip($event, 'Gradient Tool (G)')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
+              <PaintBucket :size="18" />
+            </button>
+          </template>
+        </div>
+
+        <!-- Canvas Area -->
+        <main class="canvas-area" ref="canvasContainer">
+          <canvas 
+            ref="canvas" 
+            @mousedown="handleMouseDown"
+            @mousemove="handleMouseMove"
+            @mouseup="handleMouseUp"
+            @mouseleave="handleMouseUp"
+            @wheel.prevent="handleWheel"
+          ></canvas>
+
+        <!-- Floating Gradient Stop Color Picker -->
+        <div v-if="activeStopWorldPos" class="floating-color-picker" :style="{ left: activeStopWorldPos.x + 'px', top: (activeStopWorldPos.y - 40) + 'px' }">
+            <input 
+                type="color" 
+                :value="selectedObject.fill_gradient.stops[gradientState.activeStopIndex].color" 
+                @input="e => updateGradientStop('fill', gradientState.activeStopIndex, 'color', (e.target as HTMLInputElement).value)"
+            />
+        </div>
 
         <!-- AI Processing Overlay -->
         <div v-if="aiStatus.status === 'loading'" class="ai-overlay">
@@ -2081,6 +2271,7 @@ function handleFileUpload(event: Event) {
             </div>
         </div>
       </main>
+    </div>
 
       <!-- Right Panels -->
       <aside class="side-panels">
@@ -2304,6 +2495,13 @@ function handleFileUpload(event: Event) {
                          @input="e => updateSelected('invert', Number((e.target as HTMLInputElement).value), false)"
                          @change="e => updateSelected('invert', Number((e.target as HTMLInputElement).value), true)" />
 
+                  <div class="separator-text">VECTORIZE</div>
+                  <label>Threshold</label>
+                  <input type="range" min="0" max="255" step="1" v-model="vectorizeThreshold" />
+                  <div class="actions">
+                      <button class="ai-bg-btn-large" @click="vectorizeImage" style="background: #4facfe; color: white;">✨ Trace to Path</button>
+                  </div>
+
                   <div class="actions">
                       <button class="ai-bg-btn-large" @click="removeSelectedBackground">✨ Remove Background (AI)</button>
                   </div>
@@ -2314,25 +2512,31 @@ function handleFileUpload(event: Event) {
 
               <div class="separator-text">ARRANGE</div>
               <div class="arrange-btns">
-                  <button @click="executeCommand({ action: 'move_to_front', params: { id: selectedObject.id } })" title="Bring to Front">
+                  <button @click="executeCommand({ action: 'move_to_front', params: { id: selectedObject.id } })" 
+                          @mouseenter="showTooltip($event, 'Bring to Front')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
                       <BringToFront :size="16" />
                   </button>
-                  <button @click="executeCommand({ action: 'move_forward', params: { id: selectedObject.id } })" title="Bring Forward">
+                  <button @click="executeCommand({ action: 'move_forward', params: { id: selectedObject.id } })" 
+                          @mouseenter="showTooltip($event, 'Bring Forward')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
                       <ChevronUp :size="16" />
                   </button>
-                  <button @click="executeCommand({ action: 'move_backward', params: { id: selectedObject.id } })" title="Send Backward">
+                  <button @click="executeCommand({ action: 'move_backward', params: { id: selectedObject.id } })" 
+                          @mouseenter="showTooltip($event, 'Send Backward')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
                       <ChevronDown :size="16" />
                   </button>
-                  <button @click="executeCommand({ action: 'move_to_back', params: { id: selectedObject.id } })" title="Send to Back">
+                  <button @click="executeCommand({ action: 'move_to_back', params: { id: selectedObject.id } })" 
+                          @mouseenter="showTooltip($event, 'Send to Back')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
                       <SendToBack :size="16" />
                   </button>
               </div>
 
               <div class="actions">
-                  <button class="duplicate-btn" @click="executeCommand({ action: 'duplicate', params: { id: selectedObject.id } })">
+                  <button class="duplicate-btn" @click="executeCommand({ action: 'duplicate', params: { id: selectedObject.id } })"
+                          @mouseenter="showTooltip($event, 'Duplicate Object')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
                     <Copy :size="14" style="margin-right: 6px; vertical-align: middle;" /> Duplicate Object
                   </button>
-                  <button class="delete-btn" @click="deleteSelected">
+                  <button class="delete-btn" @click="deleteSelected"
+                          @mouseenter="showTooltip($event, 'Delete Object')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
                     <Trash2 :size="14" style="margin-right: 6px; vertical-align: middle;" /> Delete Object
                   </button>
               </div>
@@ -2383,6 +2587,13 @@ function handleFileUpload(event: Event) {
                        :value="objects.find(o => o.id === targetImageId)?.invert" 
                        @input="e => executeCommand({ action: 'update', params: { id: targetImageId, invert: Number((e.target as HTMLInputElement).value) } })"
                        @change="e => executeCommand({ action: 'update', params: { id: targetImageId, invert: Number((e.target as HTMLInputElement).value), save_undo: true } })" />
+
+                <div class="separator-text" style="grid-column: span 2; margin-top: 15px;">VECTORIZE</div>
+                <label>Threshold</label>
+                <input type="range" min="0" max="255" step="1" v-model="vectorizeThreshold" />
+                <div class="actions" style="grid-column: span 2;">
+                    <button class="ai-bg-btn-large" @click="vectorizeImage" style="background: #4facfe; color: white; width: 100%;">✨ Trace to Path</button>
+                </div>
             </div>
           </section>
 
@@ -2457,10 +2668,28 @@ function handleFileUpload(event: Event) {
         </div>
       </div>
     </div>
+
+    <!-- Custom Tooltip -->
+    <div v-if="tooltip.show" class="custom-tooltip" :style="{ left: (tooltip.x + 10) + 'px', top: (tooltip.y + 10) + 'px' }">
+      {{ tooltip.text }}
+    </div>
   </div>
 </template>
 
 <style scoped>
+.custom-tooltip {
+  position: fixed;
+  background: #333;
+  color: white;
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  pointer-events: none;
+  z-index: 10000;
+  box-shadow: 0 4px 8px rgba(0,0,0,0.3);
+  white-space: nowrap;
+}
+
 :host {
   --bg-dark: #1a1a1a;
   --bg-panel: #252525;
@@ -2552,7 +2781,16 @@ function handleFileUpload(event: Event) {
   min-width: 180px;
   border-radius: 6px;
   padding: 6px 0;
-  margin-top: 4px;
+}
+
+/* Invisible bridge to keep menu open while moving mouse */
+.dropdown::before {
+    content: '';
+    position: absolute;
+    top: -10px;
+    left: 0;
+    right: 0;
+    height: 10px;
 }
 
 .menu-item:hover .dropdown {
@@ -2718,6 +2956,48 @@ function handleFileUpload(event: Event) {
   display: flex;
   flex: 1;
   overflow: hidden;
+}
+
+.workspace-area {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.top-context-bar {
+    height: 40px;
+    min-height: 40px;
+    background: #252525;
+    border-bottom: 1px solid #333;
+    display: flex;
+    align-items: center;
+    padding: 0 10px;
+    gap: 8px;
+}
+
+.top-context-bar button {
+    width: 32px;
+    height: 32px;
+    background: transparent;
+    border: none;
+    color: #999;
+    border-radius: 6px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s;
+}
+
+.top-context-bar button:hover {
+    background: #333;
+    color: white;
+}
+
+.top-context-bar button.active {
+    background: #4facfe;
+    color: white;
 }
 
 /* Toolbar */
@@ -3152,6 +3432,23 @@ canvas {
     color: #555;
     font-size: 12px;
     font-style: italic;
+}
+
+.floating-color-picker {
+    position: absolute;
+    z-index: 1000;
+    pointer-events: none;
+    opacity: 0;
+    width: 1px;
+    height: 1px;
+}
+
+.floating-color-picker input[type="color"] {
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    border: none;
+    pointer-events: auto;
 }
 
 .modal-overlay {

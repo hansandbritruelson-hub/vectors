@@ -11,7 +11,7 @@ wasm-bindgen = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde-wasm-bindgen = "0.6"
-web-sys = { version = "0.3", features = ["CanvasRenderingContext2d", "HtmlCanvasElement", "Window", "Document", "HtmlImageElement", "Blob", "Url", "Path2d", "CanvasGradient"] }
+web-sys = { version = "0.3", features = ["CanvasRenderingContext2d", "HtmlCanvasElement", "Window", "Document", "HtmlImageElement", "Blob", "Url", "Path2d", "CanvasGradient", "console"] }
 psd = "0.3"
 lopdf = "0.32"
 image = { version = "0.24", default-features = false, features = ["png", "jpeg"] }

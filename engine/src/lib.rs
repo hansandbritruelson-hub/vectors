@@ -8,6 +8,9 @@ use base64::{Engine as _, engine::general_purpose};
 use lopdf::{Document, content::Content};
 use kurbo::{BezPath, Shape, Affine};
 
+mod tracer;
+use tracer::Tracer;
+
 #[wasm_bindgen]
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
 pub enum ShapeType {
@@ -95,7 +98,8 @@ pub struct VectorObject {
     pub grayscale: f64,
     pub sepia: f64,
     pub invert: f64,
-    pub image_data_url: Option<String>,
+    #[serde(skip)]
+    pub raw_image: Option<Vec<u8>>,
     #[serde(skip)]
     pub image: Option<HtmlImageElement>,
     // Grouping
@@ -254,6 +258,7 @@ impl VectorEngine {
     }
 
     pub fn execute_command(&mut self, cmd_json: &str) -> String {
+        web_sys::console::log_1(&format!("Rust: execute_command: {}", cmd_json).into());
         #[derive(Deserialize)]
         struct Command {
             action: String,
@@ -430,6 +435,59 @@ impl VectorEngine {
                 if let Some(v) = cmd.params["enabled"].as_bool() { self.clip_to_artboard = v; }
                 "{\"success\": true}".to_string()
             }
+            "vectorize" => {
+                self.save_state();
+                let id = cmd.params["id"].as_u64().map(|v| v as u32).unwrap_or(0);
+                let threshold = cmd.params["threshold"].as_f64().unwrap_or(128.0) as u8;
+                
+                let obj_info = if let Some(obj) = self.objects.iter().find(|o| o.id == id) {
+                    if let Some(raw_image) = &obj.raw_image {
+                        Some((obj.x, obj.y, obj.width, obj.height, obj.name.clone(), raw_image.clone()))
+                    } else { None }
+                } else { None };
+
+                if let Some((ox, oy, ow, oh, oname, bytes)) = obj_info {
+                    web_sys::console::log_1(&"Rust: Vectorizing image...".into());
+                    if let Ok(img) = image::load_from_memory(&bytes) {
+                        let grayscale = img.to_luma8();
+                        let (width, height) = grayscale.dimensions();
+                        web_sys::console::log_1(&format!("Rust: Image decoded, size: {}x{}", width, height).into());
+                        
+                        let tracer = Tracer::new(width, height);
+                        let mut path_data = tracer.trace(&grayscale, threshold);
+                        web_sys::console::log_1(&format!("Rust: Trace complete, path length: {}", path_data.len()).into());
+
+                        if !path_data.is_empty() {
+                            // Scale path from image pixels to object dimensions
+                            if let Ok(mut bez) = BezPath::from_svg(&path_data) {
+                                let sx = ow / width as f64;
+                                let sy = oh / height as f64;
+                                bez.apply_affine(Affine::scale_non_uniform(sx, sy));
+                                path_data = bez.to_svg();
+                            }
+
+                            let new_id = self.add_object(
+                                ShapeType::Path,
+                                ox,
+                                oy,
+                                ow,
+                                oh,
+                                "#000000"
+                            );
+                            self.update_object(new_id, &serde_json::json!({
+                                "path_data": path_data,
+                                "name": format!("Traced {}", oname),
+                                "fill": "transparent",
+                                "stroke": "#000000",
+                                "stroke_width": 1.0
+                            }));
+                            format!("{{\"success\": true, \"id\": {}}}", new_id)
+                        } else {
+                            "{{\"error\": \"No path generated\"}}".to_string()
+                        }
+                    } else { "{{\"error\": \"Failed to load image\"}}".to_string() }
+                } else { "{{\"error\": \"Object not found or no raw image data\"}}".to_string() }
+            }
             "clear" => {
                 self.save_state();
                 self.objects.clear();
@@ -499,14 +557,10 @@ impl VectorEngine {
             }.to_string();
 
             let rgba = layer.rgba();
-            // Convert to PNG base64
             if let Some(img_buffer) = RgbaImage::from_raw(width, height, rgba) {
                 let dyn_img = DynamicImage::ImageRgba8(img_buffer);
-                let mut bytes: Vec<u8> = Vec::new();
-                if dyn_img.write_to(&mut Cursor::new(&mut bytes), ImageOutputFormat::Png).is_ok() {
-                    let b64 = general_purpose::STANDARD.encode(&bytes);
-                    let data_url = format!("data:image/png;base64,{}", b64);
-                    
+                let mut png_bytes: Vec<u8> = Vec::new();
+                if dyn_img.write_to(&mut Cursor::new(&mut png_bytes), ImageOutputFormat::Png).is_ok() {
                     let id = self.next_id;
                     self.next_id += 1;
 
@@ -554,7 +608,7 @@ impl VectorEngine {
                         grayscale: 0.0,
                         sepia: 0.0,
                         invert: 0.0,
-                        image_data_url: Some(data_url),
+                        raw_image: Some(png_bytes.clone()),
                         image: None,
                         fill_gradient: None,
                         stroke_gradient: None,
@@ -562,15 +616,18 @@ impl VectorEngine {
                     };
                     
                     self.objects.push(obj.clone());
-                    imported_objects.push(obj);
+                    
+                    // For the frontend, we add the data_url to the JSON
+                    let b64 = general_purpose::STANDARD.encode(&png_bytes);
+                    let data_url = format!("data:image/png;base64,{}", b64);
+                    let mut obj_json = serde_json::to_value(&obj).unwrap();
+                    obj_json["image_data_url"] = serde_json::Value::String(data_url);
+                    imported_objects.push(obj_json);
                 }
             }
         }
         
-        match serde_json::to_string(&imported_objects) {
-            Ok(s) => s,
-            Err(_) => "{\"error\": \"Serialization failed\"}".to_string(),
-        }
+        serde_json::to_string(&imported_objects).unwrap_or("[]".to_string())
     }
 
     fn import_ai(&mut self, data: &[u8]) -> String {
@@ -794,7 +851,7 @@ impl VectorEngine {
                                 sx: 0.0, sy: 0.0, sw: 0.0, sh: 0.0,
                                 brightness: 1.0, contrast: 1.0, saturate: 1.0, hue_rotate: 0.0, blur: 0.0,
                                 grayscale: 0.0, sepia: 0.0, invert: 0.0,
-                                image_data_url: None, image: None,
+                                raw_image: None, image: None,
                                 fill_gradient: None, stroke_gradient: None, children: None,
                             });
                         }
@@ -839,7 +896,7 @@ impl VectorEngine {
                                 sx: 0.0, sy: 0.0, sw: 0.0, sh: 0.0,
                                 brightness: 1.0, contrast: 1.0, saturate: 1.0, hue_rotate: 0.0, blur: 0.0,
                                 grayscale: 0.0, sepia: 0.0, invert: 0.0,
-                                image_data_url: None, image: None,
+                                raw_image: None, image: None,
                                 fill_gradient: None, stroke_gradient: None, children: None,
                             });
                         }
@@ -884,7 +941,7 @@ impl VectorEngine {
                                 sx: 0.0, sy: 0.0, sw: 0.0, sh: 0.0,
                                 brightness: 1.0, contrast: 1.0, saturate: 1.0, hue_rotate: 0.0, blur: 0.0,
                                 grayscale: 0.0, sepia: 0.0, invert: 0.0,
-                                image_data_url: None, image: None,
+                                raw_image: None, image: None,
                                 fill_gradient: None, stroke_gradient: None, children: None,
                             });
                         }
@@ -953,7 +1010,7 @@ impl VectorEngine {
             grayscale: 0.0,
             sepia: 0.0,
             invert: 0.0,
-            image_data_url: None,
+            raw_image: None,
             image: None,
             fill_gradient: None,
             stroke_gradient: None,
@@ -1069,13 +1126,13 @@ impl VectorEngine {
         self.objects.len() < initial_len
     }
 
-    pub fn select_point(&mut self, x: f64, y: f64, shift: bool) -> String {
+    pub fn select_point(&mut self, x: f64, y: f64, shift: bool, ignore_locked: bool) -> String {
         let tx = (x - self.viewport_x) / self.viewport_zoom;
         let ty = (y - self.viewport_y) / self.viewport_zoom;
 
         let mut hit_id = None;
         for obj in self.objects.iter().rev() {
-            if obj.locked { continue; }
+            if obj.locked && !ignore_locked { continue; }
             
             // Transform point to object's local space
             let cx = obj.x + obj.width / 2.0;
@@ -1117,7 +1174,7 @@ impl VectorEngine {
         self.get_selected_ids()
     }
 
-    pub fn select_rect(&mut self, x: f64, y: f64, width: f64, height: f64, shift: bool) -> String {
+    pub fn select_rect(&mut self, x: f64, y: f64, width: f64, height: f64, shift: bool, ignore_locked: bool) -> String {
         // x,y,width,height are in screen coords. Convert to world.
         // But wait, user might drag negative width/height. Normalize first.
         let mut sx = x;
@@ -1138,7 +1195,7 @@ impl VectorEngine {
         }
 
         for obj in &self.objects {
-            if obj.locked { continue; }
+            if obj.locked && !ignore_locked { continue; }
             // Check if object center is in selection rect (simple approx)
             // or if object intersects. For now, let's say "fully contained" or "intersects center"
             // Let's go with "intersects" which is standard for box select.
@@ -1211,6 +1268,15 @@ impl VectorEngine {
     // Keep legacy for compatibility if needed, or remove? 
     // It's safer to remove and fix calls to ensure I found all usages.
 
+
+    pub fn set_image_raw(&mut self, id: u32, data: Vec<u8>) -> bool {
+        if let Some(obj) = self.objects.iter_mut().find(|o| o.id == id) {
+            obj.raw_image = Some(data);
+            true
+        } else {
+            false
+        }
+    }
 
     pub fn get_objects_json(&self) -> String {
         serde_json::to_string(&self.objects).unwrap_or_else(|_| "[]".to_string())
