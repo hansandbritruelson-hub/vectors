@@ -1,22 +1,64 @@
 <script setup lang="ts">
-import { ref, onMounted, computed, watch, nextTick } from 'vue';
-import init, { VectorEngine } from './pkg/engine';
+import { ref, onMounted, onUnmounted, computed, watch, nextTick } from 'vue';
+import { VectorEngine } from './pkg/engine';
 import { aiService, type ModelStatus } from './ai';
 import LayerItem from './components/LayerItem.vue';
 import { 
     MousePointer2, Square, Circle, PenTool, Crop, 
     Star, Hexagon, Pipette, Type, Upload,
     Trash2, Copy, BringToFront, SendToBack, ChevronUp, ChevronDown,
-    Pencil, Eraser, Hand, Search, RotateCw, PaintBucket,
+    Pencil, Eraser, Hand, Search, RotateCw, PaintBucket, Brush,
     Zap
 } from 'lucide-vue-next';
 
-type Tool = 'select' | 'rect' | 'circle' | 'image' | 'bezier' | 'crop' | 'star' | 'poly' | 'eyedropper' | 'text' | 'pencil' | 'eraser' | 'hand' | 'zoom' | 'rotate' | 'gradient' | 'vectorize';
+type Tool = 'select' | 'rect' | 'circle' | 'image' | 'bezier' | 'crop' | 'star' | 'poly' | 'eyedropper' | 'text' | 'pencil' | 'brush' | 'eraser' | 'hand' | 'zoom' | 'rotate' | 'gradient' | 'vectorize';
 
 const canvas = ref<HTMLCanvasElement | null>(null);
 const canvasContainer = ref<HTMLElement | null>(null);
 const chatHistory = ref<HTMLElement | null>(null);
 const engine = ref<VectorEngine | null>(null);
+const engineLoadError = ref<string | null>(null);
+
+// Brush State
+const brushes = ref<any[]>([]);
+const selectedBrushId = ref(1);
+const brushColor = ref('#000000');
+const brushState = ref({
+    isDrawing: false,
+    points: [] as { x: number, y: number, pressure: number }[],
+    currentObjId: -1,
+});
+
+function updateBrushById(brush: any) {
+    if (!engine.value || !brush) return;
+    // Ensure numeric values are actually numbers (not strings from inputs)
+    const sanitizedBrush = {
+        ...brush,
+        size: Number(brush.size),
+        spacing: Number(brush.spacing),
+        smoothing: Number(brush.smoothing),
+        scatter: Number(brush.scatter),
+        rotation_jitter: Number(brush.rotation_jitter),
+        min_size_fraction: Number(brush.min_size_fraction || 0.2)
+    };
+    executeCommand({
+        action: 'update_brush',
+        params: sanitizedBrush
+    });
+}
+
+function updateBrush() {
+    updateBrushById(activeBrush.value);
+}
+
+const activeBrush = computed({
+    get: () => brushes.value.find(b => b.id === selectedBrushId.value),
+    set: (val) => {
+        const idx = brushes.value.findIndex(b => b.id === selectedBrushId.value);
+        if (idx !== -1) brushes.value[idx] = val;
+    }
+});
+
 const chatInput = ref('');
 const messages = ref<{ role: string, content: string }[]>([]);
 const fileInput = ref<HTMLInputElement | null>(null);
@@ -64,10 +106,24 @@ watch(activeTool, () => {
 });
 
 watch(selectedIds, (newIds) => {
-    if (newIds.length === 0 && !['hand', 'zoom', 'vectorize'].includes(activeTool.value)) {
-        activeTool.value = 'select';
-    }
     needsRender.value = true;
+    // Auto-enter bezier edit mode if a single path is selected
+    if (newIds.length === 1 && (activeTool.value === 'select' || activeTool.value === 'bezier' || activeTool.value === 'brush')) {
+        const obj = objects.value.find(o => o.id === newIds[0]);
+        if (obj && obj.shape_type === 'Path') {
+            bezierState.value.isEditing = true;
+            bezierState.value.currentObjId = obj.id;
+            bezierState.value.points = parsePathData(obj.path_data, obj.x, obj.y);
+        } else {
+            bezierState.value.isEditing = false;
+            bezierState.value.points = [];
+            bezierState.value.currentObjId = -1;
+        }
+    } else {
+        bezierState.value.isEditing = false;
+        bezierState.value.points = [];
+        bezierState.value.currentObjId = -1;
+    }
 }, { deep: true });
 
 watch(messages, () => {
@@ -77,6 +133,64 @@ watch(messages, () => {
         }
     });
 }, { deep: true });
+
+const vectorizeThreshold = ref(128);
+const lastVectorizedResult = ref<{ sourceId: number, pathId: number } | null>(null);
+
+function vectorizeImage(saveUndo: boolean = true) {
+    console.log("Frontend: Requesting vectorization with threshold:", vectorizeThreshold.value, "saveUndo:", saveUndo);
+    const id = targetImageId.value;
+    if (id === -1) {
+        console.warn("Frontend: No image found for vectorization");
+        return;
+    }
+
+    const obj = objects.value.find(o => o.id === id);
+    if (!obj || obj.shape_type !== 'Image') {
+        console.warn("Frontend: Selected object is not an image");
+        return;
+    }
+
+    // 1. If we are re-vectorizing, remove the previous result first
+    if (lastVectorizedResult.value && lastVectorizedResult.value.sourceId === id) {
+        if (objects.value.some(o => o.id === lastVectorizedResult.value?.pathId)) {
+            executeCommand({ 
+                action: 'delete', 
+                params: { 
+                    id: lastVectorizedResult.value.pathId,
+                    save_undo: false // Don't save undo for the intermediate delete
+                } 
+            });
+        }
+    }
+
+    // 2. Execute vectorization
+    const res = executeCommand({
+        action: 'vectorize',
+        params: {
+            id: id,
+            threshold: vectorizeThreshold.value,
+            save_undo: saveUndo
+        }
+    });
+    
+    console.log("Frontend: Vectorization result:", res);
+    if (res && res.id) {
+        lastVectorizedResult.value = { sourceId: id, pathId: res.id };
+        // Select the new path so it's visible
+        executeCommand({ action: 'select', params: { id: res.id } });
+    }
+}
+
+let vectorizeTimeout: any = null;
+watch(vectorizeThreshold, () => {
+    if (activeTool.value !== 'vectorize') return;
+    
+    if (vectorizeTimeout) clearTimeout(vectorizeTimeout);
+    vectorizeTimeout = setTimeout(() => {
+        vectorizeImage(false);
+    }, 50); // Small debounce for smoothness
+});
 
 const viewport = ref({ x: 50, y: 50, zoom: 1.0 });
 const isPanning = ref(false);
@@ -100,35 +214,6 @@ const cropState = ref({
     currentX: 0,
     currentY: 0,
 });
-
-const vectorizeThreshold = ref(128);
-
-function vectorizeImage() {
-    console.log("Frontend: Requesting vectorization...");
-    const id = targetImageId.value;
-    if (id === -1) {
-        console.warn("Frontend: No image found for vectorization");
-        return;
-    }
-
-    const obj = objects.value.find(o => o.id === id);
-    if (!obj || obj.shape_type !== 'Image') {
-        console.warn("Frontend: Selected object is not an image");
-        return;
-    }
-
-    const res = executeCommand({
-        action: 'vectorize',
-        params: {
-            id: id,
-            threshold: vectorizeThreshold.value
-        }
-    });
-    console.log("Frontend: Vectorization result:", res);
-    if (res && res.id) {
-        executeCommand({ action: 'select', params: { id: res.id } });
-    }
-}
 
 const gradientState = ref({
     isDragging: false,
@@ -226,6 +311,14 @@ function parsePathData(d: string, offsetX: number, offsetY: number): BezierPoint
             };
             points.push(currentPoint);
             firstPoint = currentPoint;
+        } else if (type === 'L') {
+            currentPoint = {
+                x: args[0] + offsetX,
+                y: args[1] + offsetY,
+                cin: { x: args[0] + offsetX, y: args[1] + offsetY },
+                cout: { x: args[0] + offsetX, y: args[1] + offsetY }
+            };
+            points.push(currentPoint);
         } else if (type === 'C') {
             // C x1 y1, x2 y2, x y
             // prev.cout = x1, y1
@@ -365,9 +458,15 @@ const selectedObject = computed(() => {
 });
 
 const targetImageId = computed(() => {
+    // 1. If an image is selected, use it
     if (selectedObject.value && selectedObject.value.shape_type === 'Image') {
         return selectedObject.value.id;
     }
+    // 2. If we just vectorized something, keep targeting that source
+    if (lastVectorizedResult.value && objects.value.some(o => o.id === lastVectorizedResult.value?.sourceId)) {
+        return lastVectorizedResult.value.sourceId;
+    }
+    // 3. Fallback to any image
     const bottomImage = objects.value.find(o => o.shape_type === 'Image');
     return bottomImage ? bottomImage.id : -1;
 });
@@ -393,6 +492,51 @@ const activeStopWorldPos = computed(() => {
         y: wy * viewport.value.zoom + viewport.value.y
     };
 });
+
+async function importBrushTip() {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = 'image/*';
+    input.onchange = async (e: any) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        
+        const reader = new FileReader();
+        reader.onload = async (re) => {
+            const img = new Image();
+            img.onload = () => {
+                if (engine.value) {
+                    const tipId = `tip_${Date.now()}`;
+                    engine.value.register_brush_tip(tipId, img);
+                    
+                    // Add a new brush with this tip
+                    const newBrush = {
+                        id: 0,
+                        name: file.name.split('.')[0],
+                        tip: { Image: { image_id: tipId } },
+                        size: 50,
+                        spacing: 0.1,
+                        pressure_enabled: true,
+                        min_size_fraction: 0.2,
+                        smoothing: 0.5,
+                        scatter: 0.0,
+                        rotation_jitter: 0.0
+                    };
+                    const id = engine.value.register_brush(JSON.stringify(newBrush));
+                    if (id > 0) {
+                        // Refresh brushes
+                        const brushesJson = engine.value.execute_command(JSON.stringify({ action: 'get_brushes', params: {} }));
+                        brushes.value = JSON.parse(brushesJson);
+                        selectedBrushId.value = id;
+                    }
+                }
+            };
+            img.src = re.target?.result as string;
+        };
+        reader.readAsDataURL(file);
+    };
+    input.click();
+}
 
 async function removeSelectedBackground() {
     const id = targetImageId.value;
@@ -444,107 +588,129 @@ watch(clipToArtboard, (val) => {
     executeCommand({ action: 'set_clipping', params: { enabled: val } });
 });
 
-onMounted(async () => {
-  await init();
-  
+onMounted(() => {
   if (canvas.value && canvasContainer.value) {
     canvas.value.width = canvasContainer.value.clientWidth;
     canvas.value.height = canvasContainer.value.clientHeight;
     
-    engine.value = new VectorEngine();
-    updateArtboard();
-    executeCommand({ action: 'add', params: { type: 'Rectangle', x: 100, y: 100, width: 200, height: 150, fill: '#4facfe' } });
-    
-    window.addEventListener('resize', handleResize);
-    window.addEventListener('keydown', (e) => {
-        if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
-
-        if (e.code === 'Space' && !isSpacePressed.value) {
-             isSpacePressed.value = true;
-             canvas.value!.style.cursor = 'grab';
+    try {
+        if (typeof VectorEngine === 'undefined') {
+            throw new Error("VectorEngine class is not defined. WASM module may have failed to load.");
         }
+        engine.value = new VectorEngine();
+        updateArtboard();
+        executeCommand({ action: 'add', params: { type: 'Rectangle', x: 100, y: 100, width: 200, height: 150, fill: '#4facfe' } });
         
-        // Tool Shortcuts
-        if (e.key.toLowerCase() === 'v') activeTool.value = 'select';
-        if (e.key.toLowerCase() === 'm') activeTool.value = 'rect';
-        if (e.key.toLowerCase() === 'r') activeTool.value = 'rotate';
-        if (e.key.toLowerCase() === 'q') activeTool.value = 'vectorize';
-        if (e.key.toLowerCase() === 'c' && hasImage.value) activeTool.value = 'crop';
-        if (e.key === 'Backspace' || e.key === 'Delete') deleteSelected();
+        window.addEventListener('resize', handleResize);
+        window.addEventListener('keydown', handleKeydown);
+        window.addEventListener('keyup', handleKeyup);
 
-        // Duplicate Shortcut
-        if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'd') {
-            if (selectedIds.value.length > 0) {
-                 // Send batch duplicate command? Or just duplicate primary?
-                 // Current engine supports one by one.
-                 // We'll just duplicate the primary one for now or iterate
-                 // The engine 'duplicate' command takes an ID and returns a NEW ID.
-                 // If we duplicate multiple, we probably want to select the new ones.
-                 // For simplicity, let's duplicate the *last* selected (primary).
-                 if (selectedObject.value) {
-                     executeCommand({ action: 'duplicate', params: { id: selectedObject.value.id } });
-                 }
-                e.preventDefault();
-            }
-        }
+        // Init Viewport
+        engine.value.set_viewport(viewport.value.x, viewport.value.y, viewport.value.zoom);
 
-        // Undo/Redo Shortcuts
-        if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') {
-            if (e.shiftKey) redo();
-            else undo();
-            e.preventDefault();
-        }
-        if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'y') {
-            redo();
-            e.preventDefault();
-        }
+        // Fetch Brushes
+        const brushesJson = engine.value.execute_command(JSON.stringify({ action: 'get_brushes', params: {} }));
+        brushes.value = JSON.parse(brushesJson);
 
-        if (e.key === 'Enter' && bezierState.value.isDrawing) {
-            // Remove the "moving" point before finishing
-            bezierState.value.points.pop();
-            const pts = bezierState.value.points;
-            if (pts.length > 0) {
-                let minX = Infinity, minY = Infinity;
-                pts.forEach(p => {
-                    minX = Math.min(minX, p.x, p.cin.x, p.cout.x);
-                    minY = Math.min(minY, p.y, p.cin.y, p.cout.y);
-                });
-
-                const newD = getPathString(pts, false, { x: minX, y: minY });
-                executeCommand({
-                    action: 'update',
-                    params: {
-                        id: bezierState.value.currentObjId,
-                        path_data: newD,
-                        x: minX,
-                        y: minY,
-                        save_undo: true
-                    }
-                });
-            }
-            bezierState.value.isDrawing = false;
-            bezierState.value.points = [];
-            activeTool.value = 'select';
-        }
-    });
-    window.addEventListener('keyup', (e) => {
-        if (e.code === 'Space') {
-            isSpacePressed.value = false;
-            isPanning.value = false;
-            canvas.value!.style.cursor = 'default';
-        }
-    });
-
-    // Init Viewport
-    engine.value.set_viewport(viewport.value.x, viewport.value.y, viewport.value.zoom);
-
-    renderLoop();
+        renderLoop();
+    } catch (err: any) {
+        console.error("Engine Initialization Error:", err);
+        engineLoadError.value = err.message || "Failed to initialize vector engine.";
+    }
   }
 
   aiService.onStatusUpdate = (status) => {
     aiStatus.value = status;
   };
 });
+
+onUnmounted(() => {
+    window.removeEventListener('resize', handleResize);
+    window.removeEventListener('keydown', handleKeydown);
+    window.removeEventListener('keyup', handleKeyup);
+    engine.value = null;
+});
+
+function handleKeydown(e: KeyboardEvent) {
+    if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+
+    if (e.code === 'Space' && !isSpacePressed.value) {
+            isSpacePressed.value = true;
+            canvas.value!.style.cursor = 'grab';
+    }
+    
+    // Tool Shortcuts
+    if (e.key.toLowerCase() === 'v') activeTool.value = 'select';
+    if (e.key.toLowerCase() === 'm') activeTool.value = 'rect';
+    if (e.key.toLowerCase() === 'b') activeTool.value = 'brush';
+    if (e.key.toLowerCase() === 'r') activeTool.value = 'rotate';
+    if (e.key.toLowerCase() === 'q') activeTool.value = 'vectorize';
+    if (e.key.toLowerCase() === 'c' && hasImage.value) activeTool.value = 'crop';
+    if (e.key === 'Backspace' || e.key === 'Delete') deleteSelected();
+
+    // Duplicate Shortcut
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'd') {
+        if (selectedIds.value.length > 0) {
+                // Send batch duplicate command? Or just duplicate primary?
+                // Current engine supports one by one.
+                // We'll just duplicate the primary one for now or iterate
+                // The engine 'duplicate' command takes an ID and returns a NEW ID.
+                // If we duplicate multiple, we probably want to select the new ones.
+                // For simplicity, let's duplicate the *last* selected (primary).
+                if (selectedObject.value) {
+                    executeCommand({ action: 'duplicate', params: { id: selectedObject.value.id } });
+                }
+            e.preventDefault();
+        }
+    }
+
+    // Undo/Redo Shortcuts
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') {
+        if (e.shiftKey) redo();
+        else undo();
+        e.preventDefault();
+    }
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'y') {
+        redo();
+        e.preventDefault();
+    }
+
+    if (e.key === 'Enter' && bezierState.value.isDrawing) {
+        // Remove the "moving" point before finishing
+        bezierState.value.points.pop();
+        const pts = bezierState.value.points;
+        if (pts.length > 0) {
+            let minX = Infinity, minY = Infinity;
+            pts.forEach(p => {
+                minX = Math.min(minX, p.x, p.cin.x, p.cout.x);
+                minY = Math.min(minY, p.y, p.cin.y, p.cout.y);
+            });
+
+            const newD = getPathString(pts, false, { x: minX, y: minY });
+            executeCommand({
+                action: 'update',
+                params: {
+                    id: bezierState.value.currentObjId,
+                    path_data: newD,
+                    x: minX,
+                    y: minY,
+                    save_undo: true
+                }
+            });
+        }
+        bezierState.value.isDrawing = false;
+        bezierState.value.points = [];
+        activeTool.value = 'select';
+    }
+}
+
+function handleKeyup(e: KeyboardEvent) {
+    if (e.code === 'Space') {
+        isSpacePressed.value = false;
+        isPanning.value = false;
+        canvas.value!.style.cursor = 'default';
+    }
+}
 
 function updateArtboard() {
     executeCommand({
@@ -621,7 +787,7 @@ function renderLoop() {
         }
 
         // Draw Bezier Handles
-        if (activeTool.value === 'bezier' && (bezierState.value.isDrawing || bezierState.value.isEditing)) {
+        if ((activeTool.value === 'bezier' || activeTool.value === 'select') && (bezierState.value.isDrawing || bezierState.value.isEditing)) {
             ctx.save();
             ctx.translate(viewport.value.x, viewport.value.y);
             ctx.scale(viewport.value.zoom, viewport.value.zoom);
@@ -736,11 +902,6 @@ function renderLoop() {
             ctx.restore();
         }
 
-        // Sync objects state for UI
-        const json = engine.value.get_objects_json();
-        objects.value = JSON.parse(json);
-        const selIdsJson = engine.value.get_selected_ids();
-        selectedIds.value = JSON.parse(selIdsJson);
       }
       needsRender.value = false;
   }
@@ -822,9 +983,9 @@ function handleWheel(e: WheelEvent) {
       return null;
   }
   
-  // Mouse Interactions
-  function handleMouseDown(e: MouseEvent) {
-  console.log("handleMouseDown", activeTool.value);
+  // Pointer Interactions
+  function handlePointerDown(e: PointerEvent) {
+  console.log("handlePointerDown", activeTool.value);
   if (!canvas.value || !engine.value) return;
   const rect = canvas.value.getBoundingClientRect();
   const x = e.clientX - rect.left;
@@ -839,10 +1000,30 @@ function handleWheel(e: WheelEvent) {
       return;
   }
 
-  isDragging.value = true; // Default to true, might set to false if box select
+  isDragging.value = true;
   needsRender.value = true;
 
   const worldPos = screenToWorld(x, y);
+
+  if (activeTool.value === 'brush') {
+      if (engine.value) engine.value.hide_selection = true;
+      const res = executeCommand({
+          action: 'create_brush_stroke',
+          params: {
+              brush_id: selectedBrushId.value,
+              color: brushColor.value,
+              points: [{ x: worldPos.x, y: worldPos.y, pressure: e.pressure || 0.5 }],
+              save_undo: false
+          }
+      });
+      if (res && res.id) {
+          brushState.value.isDrawing = true;
+          brushState.value.currentObjId = res.id;
+          brushState.value.points = [{ x: worldPos.x, y: worldPos.y, pressure: e.pressure || 0.5 }];
+          executeCommand({ action: 'select', params: { id: res.id } });
+      }
+      return;
+  }
 
   if (activeTool.value === 'pencil') {
       const res = executeCommand({
@@ -859,7 +1040,7 @@ function handleWheel(e: WheelEvent) {
           pencilState.value.isDrawing = true;
           pencilState.value.currentObjId = res.id;
           pencilState.value.points = [{ x: worldPos.x, y: worldPos.y }];
-          engine.value.execute_command(JSON.stringify({ action: 'select', params: { id: res.id } }));
+          executeCommand({ action: 'select', params: { id: res.id } });
       }
       return;
   }
@@ -1031,7 +1212,7 @@ function handleWheel(e: WheelEvent) {
                     { x: worldPos.x, y: worldPos.y, cin: {x: worldPos.x, y: worldPos.y}, cout: {x: worldPos.x, y: worldPos.y} }
                 ];
                 bezierState.value.mousePoint = { x: worldPos.x, y: worldPos.y };
-                engine.value.execute_command(JSON.stringify({ action: 'select', params: { id: res.id } }));
+                executeCommand({ action: 'select', params: { id: res.id } });
             }
       } else if (bezierState.value.isDrawing) {
           // Check for Snap-Close
@@ -1075,6 +1256,18 @@ function handleWheel(e: WheelEvent) {
   }
 
   if (activeTool.value === 'select') {
+    // Check Bezier handles first if editing
+    if (bezierState.value.isEditing) {
+        const worldPos = screenToWorld(x, y);
+        const hit = hitTestBezierHandles(worldPos.x, worldPos.y);
+        if (hit) {
+            bezierState.value.dragIndex = hit.index;
+            bezierState.value.dragType = hit.type;
+            isDragging.value = true;
+            return;
+        }
+    }
+
     // Check handles first
     const handleHitStr = engine.value?.hit_test_handles(x, y);
     const handleHit = handleHitStr ? JSON.parse(handleHitStr) : null;
@@ -1127,31 +1320,21 @@ function handleWheel(e: WheelEvent) {
         currentX: worldPos.x,
         currentY: worldPos.y,
     };
-  } else if (activeTool.value === 'rect' || activeTool.value === 'circle') {
-    const type = activeTool.value === 'rect' ? 'Rectangle' : 'Circle';
+  } else if (['rect', 'circle', 'star', 'poly'].includes(activeTool.value)) {
+    const type = activeTool.value === 'rect' ? 'Rectangle' : 
+                 activeTool.value === 'circle' ? 'Circle' :
+                 activeTool.value === 'star' ? 'Star' : 'Polygon';
     const res = executeCommand({
         action: 'add',
         params: { type, x: worldPos.x, y: worldPos.y, width: 1, height: 1, fill: '#4facfe' }
     });
-    if (res.id) {
-        engine.value.execute_command(JSON.stringify({ action: 'select', params: { id: res.id } }));
-        // Force update state immediately so mousemove can see it
-        const json = engine.value.get_objects_json();
-        objects.value = JSON.parse(json);
-        selectedIds.value = [res.id];
-    }
-  } else if (activeTool.value === 'star' || activeTool.value === 'poly') {
-    const type = activeTool.value === 'star' ? 'Star' : 'Polygon';
-    const res = executeCommand({
-        action: 'add',
-        params: { type, x: worldPos.x, y: worldPos.y, width: 1, height: 1, fill: '#4facfe', sides: 5 }
-    });
-    if (res.id) {
-        engine.value.execute_command(JSON.stringify({ action: 'select', params: { id: res.id } }));
-        // Force update state immediately
-        const json = engine.value.get_objects_json();
-        objects.value = JSON.parse(json);
-        selectedIds.value = [res.id];
+    if (res && res.id) {
+        executeCommand({ action: 'select', params: { id: res.id } });
+        
+        // Prepare for dragging/resizing immediately
+        initialObjectsState.value.clear();
+        initialObjectsState.value.set(res.id, { x: worldPos.x, y: worldPos.y, width: 1, height: 1, rotation: 0 });
+        isDragging.value = true;
     }
   } else if (activeTool.value === 'text') {
     const res = executeCommand({
@@ -1159,11 +1342,7 @@ function handleWheel(e: WheelEvent) {
         params: { type: 'Text', x: worldPos.x, y: worldPos.y, width: 200, height: 40, fill: '#000000' }
     });
     if (res.id) {
-        engine.value.execute_command(JSON.stringify({ action: 'select', params: { id: res.id } }));
-        // Force update state immediately
-        const json = engine.value.get_objects_json();
-        objects.value = JSON.parse(json);
-        selectedIds.value = [res.id];
+        executeCommand({ action: 'select', params: { id: res.id } });
     }
   } else if (activeTool.value === 'eyedropper') {
       const ctx = canvas.value.getContext('2d');
@@ -1188,12 +1367,12 @@ function handleWheel(e: WheelEvent) {
       nextTick(() => {
           vectorizeImage();
       });
+      return;
   }
 }
 
-function handleMouseMove(e: MouseEvent) {
+function handlePointerMove(e: PointerEvent) {
   if (!canvas.value || !engine.value) return;
-  // console.log("handleMouseMove", activeTool.value, isDragging.value); // Too spammy
   const rect = canvas.value.getBoundingClientRect();
   const x = e.clientX - rect.left;
   const y = e.clientY - rect.top;
@@ -1228,7 +1407,7 @@ function handleMouseMove(e: MouseEvent) {
   // Set Cursor
   if (isPanning.value || activeTool.value === 'hand') {
       canvas.value.style.cursor = isPanning.value ? 'grabbing' : 'grab';
-  } else if (activeTool.value === 'pencil' || activeTool.value === 'bezier' || activeTool.value === 'vectorize' || activeTool.value === 'eraser') {
+  } else if (activeTool.value === 'pencil' || activeTool.value === 'brush' || activeTool.value === 'bezier' || activeTool.value === 'vectorize' || activeTool.value === 'eraser') {
       canvas.value.style.cursor = 'crosshair';
       if (activeTool.value === 'bezier' && bezierState.value.isDrawing && !isDragging.value && snapMode.value && bezierState.value.points.length > 2) {
           const startPt = bezierState.value.points[0];
@@ -1241,6 +1420,43 @@ function handleMouseMove(e: MouseEvent) {
       canvas.value.style.cursor = e.altKey ? 'zoom-out' : 'zoom-in';
   } else {
       canvas.value.style.cursor = 'default';
+  }
+
+  if (activeTool.value === 'brush') {
+      if (brushState.value.isDrawing) {
+          const lastPt = brushState.value.points[brushState.value.points.length - 1];
+          const dist = Math.sqrt((worldPos.x - lastPt.x)**2 + (worldPos.y - lastPt.y)**2);
+          
+          if (dist > 2 / viewport.value.zoom) {
+              brushState.value.points.push({ x: worldPos.x, y: worldPos.y, pressure: e.pressure || 0.5 });
+              
+              if (brushState.value.currentObjId === -1) {
+                  // Create initial stroke
+                  const res = executeCommand({
+                      action: 'create_brush_stroke',
+                      params: {
+                          brush_id: selectedBrushId.value,
+                          color: brushColor.value,
+                          points: brushState.value.points,
+                          save_undo: false
+                      }
+                  });
+                  if (res && res.id) brushState.value.currentObjId = res.id;
+              } else {
+                  // Update existing stroke
+                  executeCommand({
+                      action: 'update_brush_stroke',
+                      params: {
+                          id: brushState.value.currentObjId,
+                          brush_id: selectedBrushId.value,
+                          points: brushState.value.points
+                      }
+                  });
+                  needsRender.value = true;
+              }
+          }
+          return;
+      }
   }
 
   if (activeTool.value === 'pencil') {
@@ -1429,52 +1645,57 @@ function handleMouseMove(e: MouseEvent) {
     return;
   }
 
+  if ((activeTool.value === 'bezier' || activeTool.value === 'select') && bezierState.value.isEditing && isDragging.value && bezierState.value.dragIndex !== -1) {
+      const pts = bezierState.value.points;
+      const idx = bezierState.value.dragIndex;
+      const type = bezierState.value.dragType;
+      const pt = pts[idx];
+      
+      if (type === 'anchor') {
+          const dx = worldPos.x - pt.x;
+          const dy = worldPos.y - pt.y;
+          pt.x = worldPos.x;
+          pt.y = worldPos.y;
+          pt.cin.x += dx;
+          pt.cin.y += dy;
+          pt.cout.x += dx;
+          pt.cout.y += dy;
+      } else if (type === 'cin') {
+          pt.cin = { x: worldPos.x, y: worldPos.y };
+      } else if (type === 'cout') {
+          pt.cout = { x: worldPos.x, y: worldPos.y };
+      }
+      
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      pts.forEach(p => {
+          minX = Math.min(minX, p.x, p.cin.x, p.cout.x);
+          minY = Math.min(minY, p.y, p.cin.y, p.cout.y);
+          maxX = Math.max(maxX, p.x, p.cin.x, p.cout.x);
+          maxY = Math.max(maxY, p.y, p.cin.y, p.cout.y);
+      });
+      
+      const d = getPathString(pts, bezierState.value.isClosing, null, { x: minX, y: minY });
+      
+      executeCommand({
+          action: 'update',
+          params: {
+              id: bezierState.value.currentObjId,
+              path_data: d,
+              x: minX,
+              y: minY,
+              width: Math.max(1, maxX - minX),
+              height: Math.max(1, maxY - minY),
+              save_undo: false
+          }
+      });
+      return;
+  }
+
   if (activeTool.value === 'bezier') {
       const pts = bezierState.value.points;
       
-      // EDIT MODE
+      // EDIT MODE (already handled above for both select/bezier)
       if (bezierState.value.isEditing && isDragging.value && bezierState.value.dragIndex !== -1) {
-          const idx = bezierState.value.dragIndex;
-          const type = bezierState.value.dragType;
-          const pt = pts[idx];
-          
-          if (type === 'anchor') {
-              const dx = worldPos.x - pt.x;
-              const dy = worldPos.y - pt.y;
-              pt.x = worldPos.x;
-              pt.y = worldPos.y;
-              pt.cin.x += dx;
-              pt.cin.y += dy;
-              pt.cout.x += dx;
-              pt.cout.y += dy;
-          } else if (type === 'cin') {
-              pt.cin = { x: worldPos.x, y: worldPos.y };
-          } else if (type === 'cout') {
-              pt.cout = { x: worldPos.x, y: worldPos.y };
-          }
-          
-          let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-          pts.forEach(p => {
-              minX = Math.min(minX, p.x, p.cin.x, p.cout.x);
-              minY = Math.min(minY, p.y, p.cin.y, p.cout.y);
-              maxX = Math.max(maxX, p.x, p.cin.x, p.cout.x);
-              maxY = Math.max(maxY, p.y, p.cin.y, p.cout.y);
-          });
-          
-          const d = getPathString(pts, bezierState.value.isClosing, null, { x: minX, y: minY });
-          
-          executeCommand({
-              action: 'update',
-              params: {
-                  id: bezierState.value.currentObjId,
-                  path_data: d,
-                  x: minX,
-                  y: minY,
-                  width: Math.max(1, maxX - minX),
-                  height: Math.max(1, maxY - minY),
-                  save_undo: false
-              }
-          });
           return;
       }
 
@@ -1560,6 +1781,13 @@ function handleMouseMove(e: MouseEvent) {
             });
         }
     });
+
+    if (bezierState.value.isEditing && selectedIds.value.length === 1) {
+        const obj = objects.value.find(o => o.id === selectedIds.value[0]);
+        if (obj) {
+            bezierState.value.points = parsePathData(obj.path_data, obj.x, obj.y);
+        }
+    }
   } else if (['rect', 'circle', 'star', 'poly'].includes(activeTool.value) && selectedObject.value) {
     const startWorld = screenToWorld(dragStart.value.x, dragStart.value.y);
     const width = Math.max(1, worldPos.x - startWorld.x);
@@ -1573,7 +1801,7 @@ function handleMouseMove(e: MouseEvent) {
   lastMousePos.value = { x, y };
 }
 
-function handleMouseUp(e: MouseEvent) {
+function handlePointerUp(e: PointerEvent) {
   if (isPanning.value) {
       isPanning.value = false;
       if (canvas.value) canvas.value.style.cursor = isSpacePressed.value ? 'grab' : 'default';
@@ -1591,6 +1819,33 @@ function handleMouseUp(e: MouseEvent) {
           needsRender.value = true;
       }
       // We don't return here because we might need to reset tools or other cleanup
+  }
+
+  if (activeTool.value === 'brush' && brushState.value.isDrawing) {
+      if (engine.value) engine.value.hide_selection = false;
+      if (brushState.value.points.length > 1 && brushState.value.currentObjId !== -1) {
+          // Finalize the stroke with an undo point
+          // We can just update it one last time with save_undo: true
+          // Or just save_state manually. 
+          // The simplest is to create it again with save_undo: true and delete the temp one.
+          // Wait, actually we can just call update with save_undo: true.
+          executeCommand({
+              action: 'update',
+              params: {
+                  id: brushState.value.currentObjId,
+                  save_undo: true
+              }
+          });
+      } else if (brushState.value.currentObjId !== -1) {
+          // Delete if too short
+          executeCommand({ action: 'delete', params: { id: brushState.value.currentObjId, save_undo: false } });
+      }
+      brushState.value.isDrawing = false;
+      brushState.value.points = [];
+      brushState.value.currentObjId = -1;
+      syncState();
+      needsRender.value = true;
+      return;
   }
 
   if (activeTool.value === 'crop' && cropState.value.isCropping) {
@@ -1690,7 +1945,7 @@ function handleMouseUp(e: MouseEvent) {
       });
   }
 
-  if (activeTool.value === 'bezier' && bezierState.value.isEditing) {
+  if ((activeTool.value === 'bezier' || activeTool.value === 'select') && bezierState.value.isEditing) {
        if (bezierState.value.dragIndex !== -1) {
            executeCommand({
                 action: 'update',
@@ -1793,7 +2048,8 @@ function handleMouseUp(e: MouseEvent) {
   isDragging.value = false;
   initialObjectsState.value.clear();
   
-  if (!['select', 'bezier', 'pencil', 'eraser', 'hand', 'zoom', 'rotate', 'gradient', 'vectorize'].includes(activeTool.value)) {
+  const whitelist = ['select', 'bezier', 'pencil', 'brush', 'eraser', 'hand', 'zoom', 'rotate', 'gradient', 'vectorize', 'rect', 'circle', 'star', 'poly', 'text', 'eyedropper', 'crop', 'image'];
+  if (!whitelist.includes(activeTool.value)) {
       activeTool.value = 'select';
   }
 }
@@ -2125,11 +2381,8 @@ function handleFileUpload(event: Event) {
             </label>
           </div>
           <div class="menu-item" v-if="targetImageId !== -1">
-            <button @click="removeSelectedBackground" class="ai-bg-btn" style="margin-right: 8px;">
+            <button @click="removeSelectedBackground" class="ai-bg-btn">
                 ✨ Remove BG
-            </button>
-            <button @click="vectorizeImage" class="ai-bg-btn" style="background: #4facfe;">
-                ✨ Vectorize
             </button>
           </div>
         </div>
@@ -2186,6 +2439,10 @@ function handleFileUpload(event: Event) {
                 @mouseenter="showTooltip($event, 'Pencil (N)')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
           <Pencil :size="18" />
         </button>
+        <button :class="{ active: activeTool === 'brush' }" @click="activeTool = 'brush'" 
+                @mouseenter="showTooltip($event, 'Vector Brush (B)')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
+          <Brush :size="18" />
+        </button>
         <button :class="{ active: activeTool === 'eraser' }" @click="activeTool = 'eraser'" 
                 @mouseenter="showTooltip($event, 'Eraser (E)')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
           <Eraser :size="18" />
@@ -2241,12 +2498,24 @@ function handleFileUpload(event: Event) {
         <main class="canvas-area" ref="canvasContainer">
           <canvas 
             ref="canvas" 
-            @mousedown="handleMouseDown"
-            @mousemove="handleMouseMove"
-            @mouseup="handleMouseUp"
-            @mouseleave="handleMouseUp"
+            @pointerdown="handlePointerDown"
+            @pointermove="handlePointerMove"
+            @pointerup="handlePointerUp"
+            @pointercancel="handlePointerUp"
             @wheel.prevent="handleWheel"
+            style="touch-action: none;"
           ></canvas>
+
+        <!-- Engine Load Error Overlay -->
+        <div v-if="engineLoadError" class="ai-overlay">
+            <div class="ai-loader-card" style="border-color: #ff5f56;">
+                <div class="ai-loader-content">
+                    <div class="ai-loader-title" style="color: #ff5f56;">Engine Error</div>
+                    <div style="font-size: 12px; color: #ccc; margin-bottom: 15px;">{{ engineLoadError }}</div>
+                    <button @click="window.location.reload()" class="ai-bg-btn-large" style="background: #444;">Reload App</button>
+                </div>
+            </div>
+        </div>
 
         <!-- Floating Gradient Stop Color Picker -->
         <div v-if="activeStopWorldPos" class="floating-color-picker" :style="{ left: activeStopWorldPos.x + 'px', top: (activeStopWorldPos.y - 40) + 'px' }">
@@ -2277,7 +2546,76 @@ function handleFileUpload(event: Event) {
       <aside class="side-panels">
         <!-- Top Section: Properties or Layers -->
         <div class="side-panels-top">
-          <section v-if="selectedObject" class="panel properties-panel">
+          <!-- Brush Settings -->
+          <section v-if="activeTool === 'brush'" class="panel brush-panel">
+            <div class="panel-header">
+                <h3>Brush Settings</h3>
+                <button @click="importBrushTip" title="Import Brush Tip (PNG)" class="icon-btn">
+                    <Upload :size="14" />
+                </button>
+            </div>
+            <div class="property-grid">
+              <label>Brush</label>
+              <select v-model="selectedBrushId" @change="e => {
+                  const id = Number((e.target as HTMLSelectElement).value);
+                  if (selectedIds.length > 0) updateSelected('brush_id', id);
+              }">
+                  <option v-for="b in brushes" :key="b.id" :value="b.id">{{ b.name }}</option>
+              </select>
+
+              <label>Color</label>
+              <div class="color-picker">
+                  <input type="color" v-model="brushColor" @input="e => {
+                      const val = (e.target as HTMLInputElement).value;
+                      if (selectedIds.length > 0) updateSelected('fill', val);
+                  }" />
+                  <input type="text" v-model="brushColor" @input="e => {
+                      const val = (e.target as HTMLInputElement).value;
+                      if (selectedIds.length > 0) updateSelected('fill', val);
+                  }" />
+              </div>
+
+              <template v-if="activeBrush">
+                <label>Size</label>
+                <input type="number" v-model="activeBrush.size" @input="updateBrush" />
+
+                <label>Spacing</label>
+                <input type="range" min="0.01" max="1" step="0.01" v-model="activeBrush.spacing" @input="updateBrush" />
+                
+                <label>Smoothing</label>
+                <input type="range" min="0" max="1" step="0.1" v-model="activeBrush.smoothing" @input="updateBrush" />
+
+                <label>Scatter</label>
+                <input type="range" min="0" max="1" step="0.05" v-model="activeBrush.scatter" @input="updateBrush" />
+
+                <label>Rotation Jitter</label>
+                <input type="range" min="0" max="1" step="0.05" v-model="activeBrush.rotation_jitter" @input="updateBrush" />
+
+                <label>Pressure</label>
+                <input type="checkbox" v-model="activeBrush.pressure_enabled" @change="updateBrush" />
+              </template>
+            </div>
+          </section>
+
+          <!-- Vectorize Tool Settings -->
+          <section v-if="activeTool === 'vectorize'" class="panel vectorize-panel">
+            <h3>Vectorize Settings</h3>
+            <div class="property-grid">
+              <label>Sensitivity</label>
+              <input type="range" min="0" max="255" step="1" v-model="vectorizeThreshold" @change="vectorizeImage(true)" />
+              <div class="actions" style="grid-column: span 2;">
+                  <button class="ai-bg-btn-large" @click="vectorizeImage(true)" style="background: #4facfe; color: white; width: 100%;">
+                      ✨ Recompute
+                  </button>
+              </div>
+            </div>
+            <div v-if="targetImageId === -1" class="no-selection" style="padding: 12px; font-size: 11px; line-height: 1.4;">
+                Click on an image in the workspace to vectorize it with the current settings.
+            </div>
+          </section>
+
+          <template v-else>
+            <section v-if="selectedObject" class="panel properties-panel">
             <!-- ... existing selectedObject panel ... -->
             <h3>Properties {{ selectedIds.length > 1 ? `(${selectedIds.length})` : '' }}</h3>
             <div class="property-grid">
@@ -2298,6 +2636,42 @@ function handleFileUpload(event: Event) {
               
               <label>Rotation</label>
               <input type="number" :value="Math.round(selectedObject.rotation * 180 / Math.PI)" @input="e => updateSelected('rotation', Number((e.target as HTMLInputElement).value) * Math.PI / 180)" />
+
+              <template v-if="selectedObject.shape_type === 'Path'">
+                  <label>Brush</label>
+                  <select :value="selectedObject.brush_id" @change="e => {
+                      const bid = Number((e.target as HTMLSelectElement).value);
+                      updateSelected('brush_id', bid);
+                      if (bid > 0) selectedBrushId.value = bid;
+                  }">
+                      <option :value="0">None (Standard Stroke)</option>
+                      <option v-for="b in brushes" :key="b.id" :value="b.id">{{ b.name }}</option>
+                  </select>
+
+                  <!-- Show brush settings if a brush is active on this path -->
+                  <template v-if="selectedObject.brush_id > 0">
+                      <template v-for="b in [brushes.find(br => br.id === selectedObject.brush_id)]" :key="b?.id">
+                          <template v-if="b">
+                              <div class="separator-text">BRUSH SETTINGS ({{ b.name }})</div>
+                              
+                              <label>Size</label>
+                              <input type="number" v-model="b.size" @input="updateBrushById(b)" />
+
+                              <label>Spacing</label>
+                              <input type="range" min="0.01" max="1" step="0.01" v-model="b.spacing" @input="updateBrushById(b)" />
+                              
+                              <label>Scatter</label>
+                              <input type="range" min="0" max="1" step="0.05" v-model="b.scatter" @input="updateBrushById(b)" />
+
+                              <label>Rotation</label>
+                              <input type="range" min="0" max="1" step="0.05" v-model="b.rotation_jitter" @input="updateBrushById(b)" />
+
+                              <label>Pressure</label>
+                              <input type="checkbox" v-model="b.pressure_enabled" @change="updateBrushById(b)" />
+                          </template>
+                      </template>
+                  </template>
+              </template>
 
               <label>Fill</label>
               <div class="fill-control">
@@ -2624,6 +2998,7 @@ function handleFileUpload(event: Event) {
               />
             </div>
           </section>
+          </template>
         </div>
 
         <!-- AI Chat Panel (Always Bottom) -->
@@ -3114,6 +3489,10 @@ canvas {
   position: sticky;
   top: 0;
   z-index: 10;
+}
+
+.brush-panel .property-grid {
+    border-bottom: 1px solid #333;
 }
 
 .ai-chat-panel {

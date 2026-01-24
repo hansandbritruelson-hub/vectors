@@ -6,10 +6,13 @@ use image::{ImageOutputFormat, DynamicImage, RgbaImage};
 use std::io::Cursor;
 use base64::{Engine as _, engine::general_purpose};
 use lopdf::{Document, content::Content};
-use kurbo::{BezPath, Shape, Affine};
+use kurbo::{BezPath, Shape, Affine, Point};
 
 mod tracer;
+mod brush;
+
 use tracer::Tracer;
+use brush::{BrushEngine, StrokePoint};
 
 #[wasm_bindgen]
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
@@ -75,6 +78,9 @@ pub struct VectorObject {
     pub inner_radius: f64,
     pub corner_radius: f64,
     pub path_data: String,
+    // Brush specific
+    pub brush_id: u32,
+    pub stroke_points: Vec<StrokePoint>,
     // Text specific
     pub text_content: String,
     pub font_family: String,
@@ -108,6 +114,21 @@ pub struct VectorObject {
 
 impl VectorObject {
     fn get_world_bounds(&self) -> (f64, f64, f64, f64) {
+        if self.brush_id > 0 && !self.stroke_points.is_empty() {
+             let mut min_x = f64::INFINITY;
+             let mut min_y = f64::INFINITY;
+             let mut max_x = f64::NEG_INFINITY;
+             let mut max_y = f64::NEG_INFINITY;
+             for p in &self.stroke_points {
+                 if p.x < min_x { min_x = p.x; }
+                 if p.x > max_x { max_x = p.x; }
+                 if p.y < min_y { min_y = p.y; }
+                 if p.y > max_y { max_y = p.y; }
+             }
+             // Add padding for brush size (max default size is around 100)
+             return (min_x - 50.0, min_y - 50.0, max_x + 50.0, max_y + 50.0);
+        }
+
         let hw = self.width / 2.0;
         let hh = self.height / 2.0;
         let corners = [
@@ -166,8 +187,11 @@ pub struct VectorEngine {
     pub viewport_zoom: f64,
     artboard: Artboard,
     pub clip_to_artboard: bool,
+    pub hide_selection: bool,
     undo_stack: Vec<EngineState>,
     redo_stack: Vec<EngineState>,
+    brush_engine: BrushEngine,
+    brush_image_map: std::collections::HashMap<String, HtmlImageElement>,
 }
 
 #[wasm_bindgen]
@@ -187,8 +211,11 @@ impl VectorEngine {
                 background: "#ffffff".to_string(),
             },
             clip_to_artboard: false,
+            hide_selection: false,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            brush_engine: BrushEngine::new(),
+            brush_image_map: std::collections::HashMap::new(),
         }
     }
 
@@ -323,7 +350,9 @@ impl VectorEngine {
                 }
             }
             "delete" => {
-                self.save_state();
+                if cmd.params["save_undo"].as_bool().unwrap_or(true) {
+                    self.save_state();
+                }
                 let mut success = false;
                 if let Some(ids) = cmd.params["ids"].as_array() {
                     for id_val in ids {
@@ -436,7 +465,9 @@ impl VectorEngine {
                 "{\"success\": true}".to_string()
             }
             "vectorize" => {
-                self.save_state();
+                if cmd.params["save_undo"].as_bool().unwrap_or(true) {
+                    self.save_state();
+                }
                 let id = cmd.params["id"].as_u64().map(|v| v as u32).unwrap_or(0);
                 let threshold = cmd.params["threshold"].as_f64().unwrap_or(128.0) as u8;
                 
@@ -495,8 +526,144 @@ impl VectorEngine {
                 self.selected_ids.clear();
                 "{\"success\": true}".to_string()
             }
+            "get_brushes" => {
+                serde_json::to_string(&self.brush_engine.brushes).unwrap_or("[]".to_string())
+            }
+            "update_brush" => {
+                if let Ok(updated_brush) = serde_json::from_value::<brush::Brush>(cmd.params.clone()) {
+                    if let Some(brush) = self.brush_engine.brushes.iter_mut().find(|b| b.id == updated_brush.id) {
+                        *brush = updated_brush;
+                        "{\"success\": true}".to_string()
+                    } else {
+                        "{\"error\": \"Brush not found\"}".to_string()
+                    }
+                } else {
+                    "{\"error\": \"Invalid brush JSON\"}".to_string()
+                }
+            }
+            "create_brush_stroke" => {
+                if cmd.params["save_undo"].as_bool().unwrap_or(true) {
+                    self.save_state();
+                }
+                let brush_id = cmd.params["brush_id"].as_u64().unwrap_or(1) as u32;
+                let color = cmd.params["color"].as_str().unwrap_or("#000000");
+                
+                let points_val = &cmd.params["points"];
+                if let Some(points_arr) = points_val.as_array() {
+                    let mut stroke_points = Vec::new();
+                    let mut path = BezPath::new();
+                    
+                    for (i, p) in points_arr.iter().enumerate() {
+                        let pt = Point::new(
+                            p["x"].as_f64().unwrap_or(0.0),
+                            p["y"].as_f64().unwrap_or(0.0),
+                        );
+                        if i == 0 { path.move_to(pt); } else { path.line_to(pt); }
+                        
+                        stroke_points.push(StrokePoint {
+                            x: pt.x,
+                            y: pt.y,
+                            pressure: p["pressure"].as_f64().unwrap_or(1.0),
+                        });
+                    }
+                    
+                    let bbox = path.bounding_box();
+                    let mut path_relative = path.clone();
+                    path_relative.apply_affine(Affine::translate((-bbox.x0, -bbox.y0)));
+                    
+                    let stroke_points_relative: Vec<StrokePoint> = stroke_points.iter().map(|p| StrokePoint {
+                        x: p.x - bbox.x0,
+                        y: p.y - bbox.y0,
+                        pressure: p.pressure
+                    }).collect();
+
+                    let id = self.add_object(
+                        ShapeType::Path,
+                        bbox.x0, bbox.y0, bbox.width().max(1.0), bbox.height().max(1.0),
+                        color
+                    );
+                    
+                    self.update_object(id, &serde_json::json!({
+                        "brush_id": brush_id,
+                        "stroke_points": stroke_points_relative,
+                        "path_data": path_relative.to_svg(),
+                        "fill": color,
+                        "name": format!("Brush Stroke {}", id)
+                    }));
+                    
+                    format!("{{\"success\": true, \"id\": {}}}", id)
+                } else {
+                    "{\"error\": \"Missing points array\"}".to_string()
+                }
+            }
+            "update_brush_stroke" => {
+                let id = cmd.params["id"].as_u64().unwrap_or(0) as u32;
+                let points_val = &cmd.params["points"];
+                if let Some(points_arr) = points_val.as_array() {
+                    let mut stroke_points = Vec::new();
+                    let mut path = BezPath::new();
+
+                    for (i, p) in points_arr.iter().enumerate() {
+                        let pt = Point::new(
+                            p["x"].as_f64().unwrap_or(0.0),
+                            p["y"].as_f64().unwrap_or(0.0),
+                        );
+                        if i == 0 { path.move_to(pt); } else { path.line_to(pt); }
+
+                        stroke_points.push(StrokePoint {
+                            x: pt.x,
+                            y: pt.y,
+                            pressure: p["pressure"].as_f64().unwrap_or(1.0),
+                        });
+                    }
+                    
+                    let bbox = path.bounding_box();
+                    let mut path_relative = path.clone();
+                    path_relative.apply_affine(Affine::translate((-bbox.x0, -bbox.y0)));
+
+                    let stroke_points_relative: Vec<StrokePoint> = stroke_points.iter().map(|p| StrokePoint {
+                        x: p.x - bbox.x0,
+                        y: p.y - bbox.y0,
+                        pressure: p.pressure
+                    }).collect();
+
+                    if self.update_object(id, &serde_json::json!({ 
+                        "stroke_points": stroke_points_relative,
+                        "path_data": path_relative.to_svg(),
+                        "x": bbox.x0,
+                        "y": bbox.y0,
+                        "width": bbox.width().max(1.0),
+                        "height": bbox.height().max(1.0)
+                    })) {
+                        "{\"success\": true}".to_string()
+                    } else {
+                        "{\"error\": \"Object not found\"}".to_string()
+                    }
+                } else {
+                    "{\"error\": \"Missing points array\"}".to_string()
+                }
+            }
             _ => format!("{{\"error\": \"Unknown action: {}\"}}", cmd.action),
         }
+    }
+
+    pub fn register_brush(&mut self, brush_json: &str) -> u32 {
+        if let Ok(mut brush) = serde_json::from_str::<brush::Brush>(brush_json) {
+            let id = self.brush_engine.brushes.iter().map(|b| b.id).max().unwrap_or(0) + 1;
+            brush.id = id;
+            self.brush_engine.brushes.push(brush);
+            id
+        } else {
+            0
+        }
+    }
+
+    pub fn register_brush_tip(&mut self, id: &str, image: HtmlImageElement) {
+        self.brush_image_map.insert(id.to_string(), image);
+    }
+
+    pub fn import_abr(&mut self, data: &[u8]) -> String {
+        "{\"error\": \"ABR parsing not yet implemented\"}".to_string()
     }
 
     pub fn get_artboard(&self) -> String {
@@ -587,6 +754,8 @@ impl VectorEngine {
                         inner_radius: 0.0,
                         corner_radius: 0.0,
                         path_data: String::new(),
+                        brush_id: 0,
+                        stroke_points: Vec::new(),
                         text_content: String::new(),
                         font_family: "Inter, sans-serif".to_string(),
                         font_size: 24.0,
@@ -839,6 +1008,8 @@ impl VectorEngine {
                                 opacity: 1.0, visible: true, locked: false,
                                 sides: 0, inner_radius: 0.0, corner_radius: 0.0,
                                 path_data: new_path,
+                                brush_id: 0,
+                                stroke_points: Vec::new(),
                                 text_content: String::new(),
                                 font_family: "Inter, sans-serif".to_string(),
                                 font_size: 24.0,
@@ -884,6 +1055,8 @@ impl VectorEngine {
                                 opacity: 1.0, visible: true, locked: false,
                                 sides: 0, inner_radius: 0.0, corner_radius: 0.0,
                                 path_data: new_path,
+                                brush_id: 0,
+                                stroke_points: Vec::new(),
                                 text_content: String::new(),
                                 font_family: "Inter, sans-serif".to_string(),
                                 font_size: 24.0,
@@ -929,6 +1102,8 @@ impl VectorEngine {
                                 opacity: 1.0, visible: true, locked: false,
                                 sides: 0, inner_radius: 0.0, corner_radius: 0.0,
                                 path_data: new_path,
+                                brush_id: 0,
+                                stroke_points: Vec::new(),
                                 text_content: String::new(),
                                 font_family: "Inter, sans-serif".to_string(),
                                 font_size: 24.0,
@@ -989,6 +1164,8 @@ impl VectorEngine {
             inner_radius: 0.5,
             corner_radius: 0.0,
             path_data: String::new(),
+            brush_id: 0,
+            stroke_points: Vec::new(),
             text_content: "Type here...".to_string(),
             font_family: "Inter, sans-serif".to_string(),
             font_size: 24.0,
@@ -1096,6 +1273,14 @@ impl VectorEngine {
             if let Some(v) = params["inner_radius"].as_f64() { obj.inner_radius = v; }
             if let Some(v) = params["corner_radius"].as_f64() { obj.corner_radius = v; }
             if let Some(v) = params["path_data"].as_str() { obj.path_data = v.to_string(); }
+            if let Some(v) = params["brush_id"].as_u64() { obj.brush_id = v as u32; }
+            if let Some(pts) = params["stroke_points"].as_array() {
+                obj.stroke_points = pts.iter().map(|p| StrokePoint {
+                    x: p["x"].as_f64().unwrap_or(0.0),
+                    y: p["y"].as_f64().unwrap_or(0.0),
+                    pressure: p["pressure"].as_f64().unwrap_or(1.0),
+                }).collect();
+            }
             if let Some(v) = params["brightness"].as_f64() { obj.brightness = v; }
             if let Some(v) = params["contrast"].as_f64() { obj.contrast = v; }
             if let Some(v) = params["saturate"].as_f64() { obj.saturate = v; }
@@ -1287,6 +1472,7 @@ impl VectorEngine {
             if obj.sw == 0.0 { obj.sw = image.width() as f64; }
             if obj.sh == 0.0 { obj.sh = image.height() as f64; }
             obj.image = Some(image);
+            obj.raw_image = None; // Free memory after image is converted to browser object
             true
         } else {
             false
@@ -1319,7 +1505,9 @@ impl VectorEngine {
         ctx.restore();
         
         // Render Selection Overlay
-        self.render_selection_overlay(ctx);
+        if !self.hide_selection {
+            self.render_selection_overlay(ctx);
+        }
 
         ctx.restore();
     }
@@ -1544,9 +1732,17 @@ impl VectorEngine {
                 }
                 ShapeType::Path => {
                     if !obj.path_data.is_empty() {
-                         if let Ok(p) = Path2d::new_with_path_string(&obj.path_data) {
-                             ctx.fill_with_path_2d(&p);
-                             if obj.stroke_width > 0.0 { ctx.stroke_with_path(&p); }
+                         if let Ok(path) = BezPath::from_svg(&obj.path_data) {
+                             if obj.brush_id > 0 {
+                                 if let Some(brush) = self.brush_engine.brushes.iter().find(|b| b.id == obj.brush_id) {
+                                     self.brush_engine.render_stroke(ctx, brush, &path, &obj.fill, &self.brush_image_map);
+                                 }
+                             } else {
+                                 if let Ok(p) = Path2d::new_with_path_string(&obj.path_data) {
+                                     ctx.fill_with_path_2d(&p);
+                                     if obj.stroke_width > 0.0 { ctx.stroke_with_path(&p); }
+                                 }
+                             }
                          }
                     }
                 }
