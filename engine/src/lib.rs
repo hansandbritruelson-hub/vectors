@@ -1,12 +1,15 @@
 use wasm_bindgen::prelude::*;
 use serde::{Serialize, Deserialize};
-use web_sys::{HtmlImageElement, Path2d, CanvasGradient};
+use web_sys::{HtmlImageElement, Path2d};
+mod psd;
+mod ai;
 use psd::Psd;
+use ai::AiParser;
 use image::{ImageOutputFormat, DynamicImage, RgbaImage};
 use std::io::Cursor;
 use base64::{Engine as _, engine::general_purpose};
-use lopdf::{Document, content::Content};
 use kurbo::{BezPath, Shape, Affine, Point};
+use roxmltree;
 
 mod tracer;
 mod brush;
@@ -26,6 +29,8 @@ pub enum ShapeType {
     Path,
     Text,
     Group,
+    Adjustment,
+    Guide,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
@@ -51,6 +56,38 @@ pub struct Gradient {
     pub stops: Vec<GradientStop>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
+pub enum EffectType {
+    DropShadow,
+    InnerShadow,
+    OuterGlow,
+    InnerGlow,
+    BevelEmboss,
+    ColorOverlay,
+    GradientOverlay,
+    PatternOverlay,
+    Stroke,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct LayerEffect {
+    pub effect_type: EffectType,
+    pub enabled: bool,
+    pub color: String,
+    pub opacity: f64,
+    pub blur: f64,
+    pub x: f64,
+    pub y: f64,
+    pub size: f64,
+    pub spread: f64,
+    pub blend_mode: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct LayerStyle {
+    pub effects: Vec<LayerEffect>,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct VectorObject {
     pub id: u32,
@@ -62,8 +99,10 @@ pub struct VectorObject {
     pub height: f64,
     pub rotation: f64, // in radians
     pub fill: String,
+    #[serde(skip)]
     pub fill_gradient: Option<Gradient>, // New: Gradient support
     pub stroke: String,
+    #[serde(skip)]
     pub stroke_gradient: Option<Gradient>, // New: Gradient support
     pub stroke_width: f64,
     pub opacity: f64,
@@ -73,6 +112,11 @@ pub struct VectorObject {
     pub stroke_cap: String,
     pub stroke_join: String,
     pub stroke_dash: Vec<f64>,
+    // Layer Styles (FX)
+    pub layer_style: LayerStyle,
+    // Masking
+    pub mask_id: Option<u32>,
+    pub is_mask: bool,
     // Shape specific
     pub sides: u32,
     pub inner_radius: f64,
@@ -87,6 +131,9 @@ pub struct VectorObject {
     pub font_size: f64,
     pub font_weight: String,
     pub text_align: String,
+    pub kerning: f64,
+    pub leading: f64,
+    pub tracking: f64,
     pub shadow_color: String,
     pub shadow_blur: f64,
     pub shadow_offset_x: f64,
@@ -107,7 +154,11 @@ pub struct VectorObject {
     #[serde(skip)]
     pub raw_image: Option<Vec<u8>>,
     #[serde(skip)]
-    pub image: Option<HtmlImageElement>,
+    pub raw_rgba: Option<Vec<u8>>,
+    pub raw_rgba_width: u32,
+    pub raw_rgba_height: u32,
+    #[serde(skip)]
+    pub image: Option<JsValue>,
     // Grouping
     pub children: Option<Vec<VectorObject>>, // New: Grouping support
 }
@@ -159,6 +210,173 @@ impl VectorObject {
         }
         (min_x, min_y, max_x, max_y)
     }
+
+    pub fn to_svg_element(&self, defs: &mut Vec<String>) -> String {
+        if !self.visible { return String::new(); }
+
+        let mut attrs = Vec::new();
+
+        // Transform: first move to center, then rotate, then move back
+        let transform = format!("translate({} {}) rotate({}) translate({} {})",
+            self.x + self.width / 2.0, 
+            self.y + self.height / 2.0,
+            self.rotation.to_degrees(),
+            -self.width / 2.0,
+            -self.height / 2.0
+        );
+
+        attrs.push(format!(r##"transform="{}"##, transform));
+        
+        if self.opacity < 1.0 {
+            attrs.push(format!(r##"opacity="{}"##, self.opacity));
+        }
+        
+        if self.blend_mode != "source-over" {
+            attrs.push(format!(r##"style="mix-blend-mode: {}"##, self.blend_mode));
+        }
+
+        // Fill
+        if let Some(grad) = &self.fill_gradient {
+            let grad_id = format!("grad_fill_{}", self.id);
+            let mut grad_svg = if grad.is_radial {
+                format!(r##"<radialGradient id="{}" cx="{}" cy="{}" r="{}" fx="{}" fy="{}" gradientUnits="userSpaceOnUse">"##,
+                    grad_id, grad.x1, grad.y1, grad.r2, grad.x1, grad.y1)
+            } else {
+                format!(r##"<linearGradient id="{}" x1="{}" y1="{}" x2="{}" y2="{}" gradientUnits="userSpaceOnUse">"##,
+                    grad_id, grad.x1, grad.y1, grad.x2, grad.y2)
+            };
+            for stop in &grad.stops {
+                grad_svg.push_str(&format!(r##"<stop offset="{}" stop-color="{}" />"##, stop.offset, stop.color));
+            }
+            if grad.is_radial {
+                grad_svg.push_str("</radialGradient>");
+            } else {
+                grad_svg.push_str("</linearGradient>");
+            }
+            defs.push(grad_svg);
+            attrs.push(format!(r##"fill="url(#{})"##, grad_id));
+        } else {
+            let fill = if self.fill == "transparent" { "none".to_string() } else if self.fill.is_empty() { "none".to_string() } else { self.fill.clone() };
+            attrs.push(format!(r##"fill="{}"##, fill));
+        }
+
+        // Stroke
+        if self.stroke_width > 0.0 && self.stroke != "transparent" && !self.stroke.is_empty() {
+            if let Some(grad) = &self.stroke_gradient {
+                let grad_id = format!("grad_stroke_{}", self.id);
+                let mut grad_svg = if grad.is_radial {
+                    format!(r##"<radialGradient id="{}" cx="{}" cy="{}" r="{}" fx="{}" fy="{}" gradientUnits="userSpaceOnUse">"##,
+                        grad_id, grad.x1, grad.y1, grad.r2, grad.x1, grad.y1)
+                } else {
+                    format!(r##"<linearGradient id="{}" x1="{}" y1="{}" x2="{}" y2="{}" gradientUnits="userSpaceOnUse">"##,
+                        grad_id, grad.x1, grad.y1, grad.x2, grad.y2)
+                };
+                for stop in &grad.stops {
+                    grad_svg.push_str(&format!(r##"<stop offset="{}" stop-color="{}" />"##, stop.offset, stop.color));
+                }
+                if grad.is_radial {
+                    grad_svg.push_str("</radialGradient>");
+                } else {
+                    grad_svg.push_str("</linearGradient>");
+                }
+                defs.push(grad_svg);
+                attrs.push(format!(r##"stroke="url(#{})"##, grad_id));
+            } else {
+                attrs.push(format!(r##"stroke="{}"##, self.stroke));
+            }
+            attrs.push(format!(r##"stroke-width="{}"##, self.stroke_width));
+            attrs.push(format!(r##"stroke-linecap="{}"##, self.stroke_cap));
+            attrs.push(format!(r##"stroke-linejoin="{}"##, self.stroke_join));
+            if !self.stroke_dash.is_empty() {
+                let dash = self.stroke_dash.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(" ");
+                attrs.push(format!(r##"stroke-dasharray="{}"##, dash));
+            }
+        } else {
+            attrs.push(r##"stroke="none""##.to_string());
+        }
+
+        let attr_str = attrs.join(" ");
+
+        match self.shape_type {
+            ShapeType::Rectangle => {
+                if self.corner_radius > 0.0 {
+                    format!(r##"<rect width="{}" height="{}" rx="{}" ry="{}" {} />"##, 
+                        self.width, self.height, self.corner_radius, self.corner_radius, attr_str)
+                } else {
+                    format!(r##"<rect width="{}" height="{}" {} />"##, 
+                        self.width, self.height, attr_str)
+                }
+            }
+            ShapeType::Circle | ShapeType::Ellipse => {
+                format!(r##"<ellipse cx="{}" cy="{}" rx="{}" ry="{}" {} />"##, 
+                    self.width / 2.0, self.height / 2.0, self.width / 2.0, self.height / 2.0, attr_str)
+            }
+            ShapeType::Path => {
+                format!(r##"<path d="{}" {} />"##, self.path_data, attr_str)
+            }
+            ShapeType::Polygon => {
+                let mut points = Vec::new();
+                let cx = self.width / 2.0;
+                let cy = self.height / 2.0;
+                let r = self.width / 2.0;
+                for i in 0..self.sides {
+                    let angle = (i as f64 * 2.0 * std::f64::consts::PI / self.sides as f64) - (std::f64::consts::PI / 2.0);
+                    let x = cx + r * angle.cos();
+                    let y = cy + r * angle.sin();
+                    points.push(format!("{},{}", x, y));
+                }
+                format!(r##"<polygon points="{}" {} />"##, points.join(" "), attr_str)
+            }
+            ShapeType::Star => {
+                let mut points = Vec::new();
+                let cx = self.width / 2.0;
+                let cy = self.height / 2.0;
+                let r_outer = self.width / 2.0;
+                let r_inner = self.inner_radius * (self.width / 2.0);
+                for i in 0..(self.sides * 2) {
+                    let r = if i % 2 == 0 { r_outer } else { r_inner };
+                    let angle = (i as f64 * std::f64::consts::PI / self.sides as f64) - (std::f64::consts::PI / 2.0);
+                    let x = cx + r * angle.cos();
+                    let y = cy + r * angle.sin();
+                    points.push(format!("{},{}", x, y));
+                }
+                format!(r##"<polygon points="{}" {} />"##, points.join(" "), attr_str)
+            }
+            ShapeType::Text => {
+                format!(r##"<text x="0" y="{}" font-family="{}" font-size="{}" font-weight="{}" text-anchor="{}" {}>{}</text>"##,
+                    self.font_size, self.font_family, self.font_size, self.font_weight, 
+                    if self.text_align == "left" { "start" } else if self.text_align == "right" { "end" } else { "middle" },
+                    attr_str, self.text_content)
+            }
+            ShapeType::Group => {
+                let mut inner = String::new();
+                if let Some(children) = &self.children {
+                    for child in children {
+                        inner.push_str(&child.to_svg_element(defs));
+                    }
+                }
+                format!(r##"<g {}>{}</g>"##, attr_str, inner)
+            }
+            ShapeType::Image => {
+                if let Some(raw_image) = &self.raw_image {
+                    let b64 = general_purpose::STANDARD.encode(raw_image);
+                    format!(r##"<image width="{}" height="{}" href="data:image/png;base64,{}" {} />"##,
+                        self.width, self.height, b64, attr_str)
+                } else {
+                    format!(r##"<rect width="{}" height="{}" fill="#ccc" {} />"##, self.width, self.height, attr_str)
+                }
+            }
+            ShapeType::Adjustment | ShapeType::Guide => {
+                String::new()
+            }
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Guide {
+    pub orientation: String, // "horizontal" or "vertical"
+    pub position: f64,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -166,6 +384,7 @@ pub struct Artboard {
     pub width: f64,
     pub height: f64,
     pub background: String,
+    pub guides: Vec<Guide>,
 }
 
 #[derive(Clone)]
@@ -175,6 +394,7 @@ struct EngineState {
     selected_ids: Vec<u32>,
     artboard: Artboard,
     clip_to_artboard: bool,
+    action_name: String,
 }
 
 #[wasm_bindgen]
@@ -198,6 +418,8 @@ pub struct VectorEngine {
 impl VectorEngine {
     #[wasm_bindgen(constructor)]
     pub fn new() -> VectorEngine {
+        console_error_panic_hook::set_once();
+        
         VectorEngine {
             objects: Vec::new(),
             next_id: 1,
@@ -209,6 +431,7 @@ impl VectorEngine {
                 width: 800.0,
                 height: 600.0,
                 background: "#ffffff".to_string(),
+                guides: Vec::new(),
             },
             clip_to_artboard: false,
             hide_selection: false,
@@ -219,13 +442,14 @@ impl VectorEngine {
         }
     }
 
-    fn save_state(&mut self) {
+    fn save_state(&mut self, action_name: &str) {
         let state = EngineState {
             objects: self.objects.clone(),
             next_id: self.next_id,
             selected_ids: self.selected_ids.clone(),
             artboard: self.artboard.clone(),
             clip_to_artboard: self.clip_to_artboard,
+            action_name: action_name.to_string(),
         };
         self.undo_stack.push(state);
         if self.undo_stack.len() > 100 {
@@ -242,6 +466,7 @@ impl VectorEngine {
                 selected_ids: self.selected_ids.clone(),
                 artboard: self.artboard.clone(),
                 clip_to_artboard: self.clip_to_artboard,
+                action_name: "Redo State".to_string(),
             };
             self.redo_stack.push(current_state);
 
@@ -264,6 +489,7 @@ impl VectorEngine {
                 selected_ids: self.selected_ids.clone(),
                 artboard: self.artboard.clone(),
                 clip_to_artboard: self.clip_to_artboard,
+                action_name: "Undo State".to_string(),
             };
             self.undo_stack.push(current_state);
 
@@ -284,6 +510,11 @@ impl VectorEngine {
         self.viewport_zoom = zoom;
     }
 
+    pub fn get_history(&self) -> String {
+        let history: Vec<String> = self.undo_stack.iter().map(|s| s.action_name.clone()).collect();
+        serde_json::to_string(&history).unwrap_or("[]".to_string())
+    }
+
     pub fn execute_command(&mut self, cmd_json: &str) -> String {
         web_sys::console::log_1(&format!("Rust: execute_command: {}", cmd_json).into());
         #[derive(Deserialize)]
@@ -298,8 +529,116 @@ impl VectorEngine {
         };
 
         match cmd.action.as_str() {
+            "magic_wand" => {
+                let id = cmd.params["id"].as_u64().map(|v| v as u32).unwrap_or(0);
+                let x = cmd.params["x"].as_f64().unwrap_or(0.0);
+                let y = cmd.params["y"].as_f64().unwrap_or(0.0);
+                let tolerance = cmd.params["tolerance"].as_f64().unwrap_or(30.0);
+                
+                if let Some(obj) = self.objects.iter().find(|o| o.id == id) {
+                    if let Some(rgba) = &obj.raw_rgba {
+                        let width = obj.raw_rgba_width;
+                        let height = obj.raw_rgba_height;
+                        
+                        // Map world coords to local image pixels
+                        let local_x = ((x - obj.x) / obj.width * width as f64) as i32;
+                        let local_y = ((y - obj.y) / obj.height * height as f64) as i32;
+                        
+                        if local_x >= 0 && local_x < width as i32 && local_y >= 0 && local_y < height as i32 {
+                            let start_idx = (local_y as u32 * width + local_x as u32) as usize * 4;
+                            let start_r = rgba[start_idx];
+                            let start_g = rgba[start_idx + 1];
+                            let start_b = rgba[start_idx + 2];
+                            
+                            // Simple flood fill to find mask
+                            let mut mask = vec![false; (width * height) as usize];
+                            let mut stack = vec![(local_x, local_y)];
+                            mask[(local_y as u32 * width + local_x as u32) as usize] = true;
+                            
+                            while let Some((cx, cy)) = stack.pop() {
+                                for (dx, dy) in [(0, 1), (0, -1), (1, 0), (-1, 0)] {
+                                    let nx = cx + dx;
+                                    let ny = cy + dy;
+                                    if nx >= 0 && nx < width as i32 && ny >= 0 && ny < height as i32 {
+                                        let idx = (ny as u32 * width + nx as u32) as usize;
+                                        if !mask[idx] {
+                                            let p_idx = idx * 4;
+                                            let dist = ((rgba[p_idx] as f64 - start_r as f64).powi(2) +
+                                                       (rgba[p_idx+1] as f64 - start_g as f64).powi(2) +
+                                                       (rgba[p_idx+2] as f64 - start_b as f64).powi(2)).sqrt();
+                                            if dist <= tolerance {
+                                                mask[idx] = true;
+                                                stack.push((nx, ny));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            // Convert mask to a Path (simplified: just return the count for now or a path)
+                            // Real implementation would use the Tracer to convert mask to SVG path
+                            let tracer = Tracer::new(width, height);
+                            // We need a grayscale image for tracer, so we use our mask
+                            let mut mask_img = vec![0u8; (width * height) as usize];
+                            for i in 0..mask.len() {
+                                if mask[i] { mask_img[i] = 255; }
+                            }
+                            let luma = image::ImageBuffer::<image::Luma<u8>, Vec<u8>>::from_raw(width, height, mask_img).unwrap();
+                            let mut path_data = tracer.trace(&luma, 128);
+                            
+                            // Scale path to object size
+                            if let Ok(mut bez) = BezPath::from_svg(&path_data) {
+                                let sx = obj.width / width as f64;
+                                let sy = obj.height / height as f64;
+                                bez.apply_affine(Affine::scale_non_uniform(sx, sy));
+                                path_data = bez.to_svg();
+                            }
+
+                            let new_id = self.add_object(ShapeType::Path, obj.x, obj.y, obj.width, obj.height, "#4facfe");
+                            self.update_object(new_id, &serde_json::json!({
+                                "path_data": path_data,
+                                "fill": "rgba(79, 172, 254, 0.3)",
+                                "stroke": "#4facfe",
+                                "stroke_width": 1.0,
+                                "name": "Selection Mask"
+                            }));
+                            
+                            return format!("{{\"success\": true, \"id\": {}}}", new_id);
+                        }
+                    }
+                }
+                "{\"error\": \"Image not found or click outside image\"}".to_string()
+            }
+            "add_guide" => {
+                let orientation = cmd.params["orientation"].as_str().unwrap_or("horizontal").to_string();
+                let position = cmd.params["position"].as_f64().unwrap_or(0.0);
+                self.artboard.guides.push(Guide { orientation, position });
+                "{\"success\": true}".to_string()
+            }
+            "clear_guides" => {
+                self.artboard.guides.clear();
+                "{\"success\": true}".to_string()
+            }
+            "get_history" => self.get_history(),
+            "boolean_operation" => {
+                self.save_state("Boolean Operation");
+                let op = cmd.params["operation"].as_str().unwrap_or("union");
+                let ids: Vec<u32> = cmd.params["ids"].as_array()
+                    .unwrap_or(&vec![])
+                    .iter()
+                    .filter_map(|v| v.as_u64().map(|id| id as u32))
+                    .collect();
+                
+                if ids.len() < 2 {
+                    return "{\"error\": \"At least 2 objects required\"}".to_string();
+                }
+
+                // Placeholder for real boolean operations using a library like clipper2
+                // For now, we'll just log and return error until we add the dependency
+                "{\"error\": \"Boolean operations require additional dependencies (clipper2)\"}".to_string()
+            }
             "add" => {
-                self.save_state();
+                self.save_state("Add Object");
                 let st = match cmd.params["type"].as_str() {
                     Some("Circle") => ShapeType::Circle,
                     Some("Ellipse") => ShapeType::Ellipse,
@@ -325,7 +664,7 @@ impl VectorEngine {
             }
             "update" => {
                 if cmd.params["save_undo"].as_bool().unwrap_or(false) {
-                    self.save_state();
+                    self.save_state("Update Object");
                 }
                 let mut success = false;
                 if let Some(ids) = cmd.params["ids"].as_array() {
@@ -351,7 +690,7 @@ impl VectorEngine {
             }
             "delete" => {
                 if cmd.params["save_undo"].as_bool().unwrap_or(true) {
-                    self.save_state();
+                    self.save_state("Delete Object");
                 }
                 let mut success = false;
                 if let Some(ids) = cmd.params["ids"].as_array() {
@@ -375,7 +714,7 @@ impl VectorEngine {
                 }
             }
             "duplicate" => {
-                self.save_state();
+                self.save_state("Duplicate Object");
                 let id = cmd.params["id"].as_u64().map(|v| v as u32).unwrap_or(0);
                 if let Some(pos) = self.objects.iter().position(|o| o.id == id) {
                     let mut new_obj = self.objects[pos].clone();
@@ -403,7 +742,7 @@ impl VectorEngine {
                 "{\"success\": true}".to_string()
             }
             "move_to_back" => {
-                self.save_state();
+                self.save_state("Move to Back");
                 let id = cmd.params["id"].as_u64().map(|v| v as u32).unwrap_or(0);
                 if let Some(pos) = self.objects.iter().position(|o| o.id == id) {
                     let obj = self.objects.remove(pos);
@@ -414,7 +753,7 @@ impl VectorEngine {
                 }
             }
             "move_to_front" => {
-                self.save_state();
+                self.save_state("Move to Front");
                 let id = cmd.params["id"].as_u64().map(|v| v as u32).unwrap_or(0);
                 if let Some(pos) = self.objects.iter().position(|o| o.id == id) {
                     let obj = self.objects.remove(pos);
@@ -425,7 +764,7 @@ impl VectorEngine {
                 }
             }
             "move_forward" => {
-                self.save_state();
+                self.save_state("Move Forward");
                 let id = cmd.params["id"].as_u64().map(|v| v as u32).unwrap_or(0);
                 if let Some(pos) = self.objects.iter().position(|o| o.id == id) {
                     if pos < self.objects.len() - 1 {
@@ -439,7 +778,7 @@ impl VectorEngine {
                 }
             }
             "move_backward" => {
-                self.save_state();
+                self.save_state("Move Backward");
                 let id = cmd.params["id"].as_u64().map(|v| v as u32).unwrap_or(0);
                 if let Some(pos) = self.objects.iter().position(|o| o.id == id) {
                     if pos > 0 {
@@ -453,20 +792,20 @@ impl VectorEngine {
                 }
             }
             "set_artboard" => {
-                self.save_state();
+                self.save_state("Set Artboard");
                 if let Some(w) = cmd.params["width"].as_f64() { self.artboard.width = w; }
                 if let Some(h) = cmd.params["height"].as_f64() { self.artboard.height = h; }
                 if let Some(bg) = cmd.params["background"].as_str() { self.artboard.background = bg.to_string(); }
                 "{\"success\": true}".to_string()
             }
             "set_clipping" => {
-                self.save_state();
+                self.save_state("Set Clipping");
                 if let Some(v) = cmd.params["enabled"].as_bool() { self.clip_to_artboard = v; }
                 "{\"success\": true}".to_string()
             }
             "vectorize" => {
                 if cmd.params["save_undo"].as_bool().unwrap_or(true) {
-                    self.save_state();
+                    self.save_state("Vectorize Image");
                 }
                 let id = cmd.params["id"].as_u64().map(|v| v as u32).unwrap_or(0);
                 let threshold = cmd.params["threshold"].as_f64().unwrap_or(128.0) as u8;
@@ -520,7 +859,7 @@ impl VectorEngine {
                 } else { "{{\"error\": \"Object not found or no raw image data\"}}".to_string() }
             }
             "clear" => {
-                self.save_state();
+                self.save_state("Clear Document");
                 self.objects.clear();
                 self.next_id = 1;
                 self.selected_ids.clear();
@@ -543,7 +882,7 @@ impl VectorEngine {
             }
             "create_brush_stroke" => {
                 if cmd.params["save_undo"].as_bool().unwrap_or(true) {
-                    self.save_state();
+                    self.save_state("Brush Stroke");
                 }
                 let brush_id = cmd.params["brush_id"].as_u64().unwrap_or(1) as u32;
                 let color = cmd.params["color"].as_str().unwrap_or("#000000");
@@ -670,11 +1009,289 @@ impl VectorEngine {
         serde_json::to_string(&self.artboard).unwrap_or("{}".to_string())
     }
 
+    pub fn export_svg(&self) -> String {
+        let mut defs = Vec::new();
+        let mut body = String::new();
+
+        for obj in &self.objects {
+            body.push_str(&obj.to_svg_element(&mut defs));
+        }
+
+        let defs_str = if defs.is_empty() {
+            String::new()
+        } else {
+            format!("<defs>{}</defs>", defs.join(""))
+        };
+
+        format!(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="{}" height="{}" viewBox="0 0 {} {}"><rect width="100%" height="100%" fill="{}" />{}{}</svg>"##,
+            self.artboard.width, self.artboard.height, self.artboard.width, self.artboard.height,
+            self.artboard.background,
+            defs_str,
+            body
+        )
+    }
+
+    pub fn import_svg(&mut self, data: &[u8]) -> String {
+        let svg_str = String::from_utf8_lossy(data);
+        let doc = match roxmltree::Document::parse(&svg_str) {
+            Ok(d) => d,
+            Err(e) => return format!("{{\"error\": \"Failed to parse SVG: {:?}\"}}", e),
+        };
+
+        let root = doc.root_element();
+        let mut width = root.attribute("width").and_then(|s| s.parse::<f64>().ok()).unwrap_or(800.0);
+        let mut height = root.attribute("height").and_then(|s| s.parse::<f64>().ok()).unwrap_or(600.0);
+
+        if let Some(viewbox) = root.attribute("viewBox") {
+            let parts: Vec<f64> = viewbox.split_whitespace().filter_map(|s| s.parse::<f64>().ok()).collect();
+            if parts.len() == 4 {
+                width = parts[2];
+                height = parts[3];
+            }
+        }
+
+        let mut objects = Vec::new();
+        let mut next_id = self.next_id;
+
+        self.parse_svg_node(root, &mut objects, &mut next_id);
+
+        self.next_id = next_id;
+        
+        let result = serde_json::json!({
+            "width": width,
+            "height": height,
+            "objects": objects
+        });
+
+        result.to_string()
+    }
+
+    fn parse_svg_node(&self, node: roxmltree::Node, objects: &mut Vec<VectorObject>, next_id: &mut u32) {
+        for child in node.children() {
+            if !child.is_element() { continue; }
+
+            match child.tag_name().name() {
+                "rect" => {
+                    let x = child.attribute("x").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                    let y = child.attribute("y").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                    let w = child.attribute("width").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                    let h = child.attribute("height").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                    let rx = child.attribute("rx").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                    
+                    let mut obj = self.create_default_object(*next_id, ShapeType::Rectangle, x, y, w, h);
+                    obj.corner_radius = rx;
+                    obj.name = format!("Rectangle {}", *next_id);
+                    self.apply_svg_styles(child, &mut obj);
+                    objects.push(obj);
+                    *next_id += 1;
+                }
+                "circle" | "ellipse" => {
+                    let cx = child.attribute("cx").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                    let cy = child.attribute("cy").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                    let (rx, ry) = if child.tag_name().name() == "circle" {
+                        let r = child.attribute("r").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                        (r, r)
+                    } else {
+                        let rx = child.attribute("rx").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                        let ry = child.attribute("ry").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                        (rx, ry)
+                    };
+                    
+                    let mut obj = self.create_default_object(*next_id, ShapeType::Circle, cx - rx, cy - ry, rx * 2.0, ry * 2.0);
+                    obj.name = format!("{} {}", if child.tag_name().name() == "circle" { "Circle" } else { "Ellipse" }, *next_id);
+                    self.apply_svg_styles(child, &mut obj);
+                    objects.push(obj);
+                    *next_id += 1;
+                }
+                "line" => {
+                    let x1 = child.attribute("x1").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                    let y1 = child.attribute("y1").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                    let x2 = child.attribute("x2").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                    let y2 = child.attribute("y2").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                    
+                    let mut bez = BezPath::new();
+                    bez.move_to(Point::new(x1, y1));
+                    bez.line_to(Point::new(x2, y2));
+                    
+                    let bbox = bez.bounding_box();
+                    let mut obj = self.create_default_object(*next_id, ShapeType::Path, bbox.x0, bbox.y0, bbox.width().max(1.0), bbox.height().max(1.0));
+                    obj.name = format!("Line {}", *next_id);
+                    
+                    let mut normalized = bez.clone();
+                    normalized.apply_affine(Affine::translate((-bbox.x0, -bbox.y0)));
+                    obj.path_data = normalized.to_svg();
+                    
+                    self.apply_svg_styles(child, &mut obj);
+                    objects.push(obj);
+                    *next_id += 1;
+                }
+                "polyline" | "polygon" => {
+                    let points_str = child.attribute("points").unwrap_or("");
+                    let points: Vec<f64> = points_str.split(|c: char| !c.is_digit(10) && c != '.' && c != '-')
+                        .filter(|s| !s.is_empty())
+                        .filter_map(|s| s.parse::<f64>().ok())
+                        .collect();
+                    
+                    if points.len() >= 4 {
+                        let mut bez = BezPath::new();
+                        bez.move_to(Point::new(points[0], points[1]));
+                        for i in (2..points.len()).step_by(2) {
+                            if i + 1 < points.len() {
+                                bez.line_to(Point::new(points[i], points[i+1]));
+                            }
+                        }
+                        if child.tag_name().name() == "polygon" {
+                            bez.close_path();
+                        }
+                        
+                        let bbox = bez.bounding_box();
+                        let mut obj = self.create_default_object(*next_id, ShapeType::Path, bbox.x0, bbox.y0, bbox.width().max(1.0), bbox.height().max(1.0));
+                        obj.name = format!("{} {}", if child.tag_name().name() == "polygon" { "Polygon" } else { "Polyline" }, *next_id);
+                        
+                        let mut normalized = bez.clone();
+                        normalized.apply_affine(Affine::translate((-bbox.x0, -bbox.y0)));
+                        obj.path_data = normalized.to_svg();
+                        
+                        self.apply_svg_styles(child, &mut obj);
+                        objects.push(obj);
+                        *next_id += 1;
+                    }
+                }
+                "path" => {
+                    let d = child.attribute("d").unwrap_or("").to_string();
+                    if let Ok(bez) = BezPath::from_svg(&d) {
+                        let bbox = bez.bounding_box();
+                        let mut obj = self.create_default_object(*next_id, ShapeType::Path, bbox.x0, bbox.y0, bbox.width(), bbox.height());
+                        obj.name = format!("Path {}", *next_id);
+                        
+                        // Normalize path data to be relative to object x,y
+                        let mut normalized = bez.clone();
+                        normalized.apply_affine(Affine::translate((-bbox.x0, -bbox.y0)));
+                        obj.path_data = normalized.to_svg();
+                        
+                        self.apply_svg_styles(child, &mut obj);
+                        objects.push(obj);
+                        *next_id += 1;
+                    }
+                }
+                "g" => {
+                    // Flatten groups for now, but apply group styles
+                    self.parse_svg_node(child, objects, next_id);
+                }
+                _ => {
+                    // Recurse for other nodes like <svg> inside <svg> or <defs> (though we skip defs content for now)
+                    if child.tag_name().name() != "defs" && child.tag_name().name() != "style" {
+                        self.parse_svg_node(child, objects, next_id);
+                    }
+                }
+            }
+        }
+    }
+
+    fn apply_svg_styles(&self, node: roxmltree::Node, obj: &mut VectorObject) {
+        let mut fill_val = node.attribute("fill");
+        let mut stroke_val = node.attribute("stroke");
+        let mut stroke_width_val = node.attribute("stroke-width");
+        let mut opacity_val = node.attribute("opacity");
+
+        if let Some(style) = node.attribute("style") {
+            for part in style.split(';') {
+                let kv: Vec<&str> = part.split(':').collect();
+                if kv.len() == 2 {
+                    match kv[0].trim() {
+                        "fill" => fill_val = Some(kv[1].trim()),
+                        "stroke" => stroke_val = Some(kv[1].trim()),
+                        "stroke-width" => stroke_width_val = Some(kv[1].trim()),
+                        "opacity" => opacity_val = Some(kv[1].trim()),
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        if let Some(fill) = fill_val {
+            if fill != "none" { obj.fill = fill.to_string(); }
+            else { obj.fill = "transparent".to_string(); }
+        }
+        if let Some(stroke) = stroke_val {
+            if stroke != "none" { obj.stroke = stroke.to_string(); }
+            else { obj.stroke = "transparent".to_string(); }
+        }
+        if let Some(sw) = stroke_width_val {
+            obj.stroke_width = sw.parse::<f64>().unwrap_or(obj.stroke_width);
+        }
+        if let Some(op) = opacity_val {
+            obj.opacity = op.parse::<f64>().unwrap_or(obj.opacity);
+        }
+
+        if let Some(transform) = node.attribute("transform") {
+            if transform.contains("translate") {
+                let start = transform.find("translate(").unwrap() + 10;
+                let end = transform[start..].find(')').unwrap() + start;
+                let parts: Vec<f64> = transform[start..end].split(|c: char| !c.is_digit(10) && c != '.' && c != '-')
+                    .filter(|s| !s.is_empty())
+                    .filter_map(|s| s.parse::<f64>().ok())
+                    .collect();
+                if !parts.is_empty() {
+                    obj.x += parts[0];
+                    if parts.len() > 1 { obj.y += parts[1]; }
+                }
+            }
+            if transform.contains("rotate") {
+                let start = transform.find("rotate(").unwrap() + 7;
+                let end = transform[start..].find(')').unwrap() + start;
+                let parts: Vec<f64> = transform[start..end].split(|c: char| !c.is_digit(10) && c != '.' && c != '-')
+                    .filter(|s| !s.is_empty())
+                    .filter_map(|s| s.parse::<f64>().ok())
+                    .collect();
+                if !parts.is_empty() {
+                    obj.rotation = parts[0].to_radians();
+                }
+            }
+        }
+    }
+
+    fn create_default_object(&self, id: u32, shape_type: ShapeType, x: f64, y: f64, width: f64, height: f64) -> VectorObject {
+        VectorObject {
+            id,
+            shape_type,
+            name: format!("{:?} {}", shape_type, id),
+            x, y, width, height,
+            rotation: 0.0,
+            fill: "#000000".to_string(),
+            stroke: "transparent".to_string(),
+            stroke_width: 0.0,
+            opacity: 1.0,
+            visible: true, locked: false,
+            blend_mode: "source-over".to_string(),
+            stroke_cap: "butt".to_string(),
+            stroke_join: "miter".to_string(),
+            stroke_dash: Vec::new(),
+            layer_style: LayerStyle::default(),
+            mask_id: None,
+            is_mask: false,
+            sides: 4, inner_radius: 0.0, corner_radius: 0.0,
+            path_data: String::new(),
+            brush_id: 0, stroke_points: Vec::new(),
+            text_content: String::new(), font_family: "Inter, sans-serif".to_string(), font_size: 24.0, font_weight: "normal".to_string(), text_align: "left".to_string(),
+            kerning: 0.0, leading: 1.2, tracking: 0.0,
+            shadow_color: "transparent".to_string(), shadow_blur: 0.0, shadow_offset_x: 0.0, shadow_offset_y: 0.0,
+            sx: 0.0, sy: 0.0, sw: width.max(1.0), sh: height.max(1.0),
+            brightness: 1.0, contrast: 1.0, saturate: 1.0, hue_rotate: 0.0, blur: 0.0, grayscale: 0.0, sepia: 0.0, invert: 0.0,
+            raw_image: None, raw_rgba: None, raw_rgba_width: 0, raw_rgba_height: 0, image: None,
+            fill_gradient: None, stroke_gradient: None, children: None,
+        }
+    }
+
     pub fn import_file(&mut self, filename: &str, data: &[u8]) -> String {
-        if filename.to_lowercase().ends_with(".psd") {
+        let filename_lower = filename.to_lowercase();
+        if filename_lower.ends_with(".psd") {
             self.import_psd(data)
-        } else if filename.to_lowercase().ends_with(".ai") {
+        } else if filename_lower.ends_with(".ai") {
             self.import_ai(data)
+        } else if filename_lower.ends_with(".svg") {
+            self.import_svg(data)
         } else {
             "{\"error\": \"Unsupported file format\"}".to_string()
         }
@@ -683,27 +1300,57 @@ impl VectorEngine {
     fn import_psd(&mut self, data: &[u8]) -> String {
         let psd = match Psd::from_bytes(data) {
             Ok(p) => p,
-            Err(_) => return "{\"error\": \"Failed to parse PSD\"}".to_string(),
+            Err(e) => return format!("{{\"error\": \"Failed to parse PSD: {:?}\"}}", e),
         };
 
+        let width = psd.width() as u32;
+        let height = psd.height() as u32;
+        let layers = psd.layers();
+        
+        web_sys::console::log_1(&format!("PSD loaded: {}x{}, layers: {}, mode: {:?}", width, height, layers.len(), psd.color_mode()).into());
+
         let mut imported_objects = Vec::new();
+        let mut group_stack: Vec<Vec<serde_json::Value>> = vec![Vec::new()];
 
-        // Iterating layers
-        for layer in psd.layers().iter() {
-            let width = layer.width() as u32;
-            let height = layer.height() as u32;
+        // 1. ALWAYS add the composite image first (as the bottom layer)
+        let composite_rgba = psd.rgba();
+        if let Some(img_buffer) = RgbaImage::from_raw(width, height, composite_rgba.clone()) {
+            let dyn_img = DynamicImage::ImageRgba8(img_buffer);
+            let mut png_bytes: Vec<u8> = Vec::new();
+            if let Ok(_) = dyn_img.write_to(&mut Cursor::new(&mut png_bytes), ImageOutputFormat::Png) {
+                let id = self.next_id;
+                self.next_id += 1;
+
+                let obj = self.create_default_object(id, ShapeType::Image, 0.0, 0.0, width as f64, height as f64);
+                let mut obj = obj;
+                obj.name = "Composite View".to_string();
+                obj.locked = true;
+                obj.raw_image = Some(png_bytes.clone());
+                obj.raw_rgba = Some(composite_rgba.clone());
+                obj.raw_rgba_width = width;
+                obj.raw_rgba_height = height;
+                
+                self.objects.push(obj.clone());
+                
+                let b64 = general_purpose::STANDARD.encode(&png_bytes);
+                let data_url = format!("data:image/png;base64,{}", b64);
+                let mut obj_json = serde_json::to_value(&obj).unwrap();
+                obj_json["image_data_url"] = serde_json::Value::String(data_url);
+                imported_objects.push(obj_json);
+            }
+        }
+
+        // 2. Iterating layers
+        for layer in layers.iter() {
+            let l_width = layer.width() as u32;
+            let l_height = layer.height() as u32;
             let name = layer.name().to_string();
-            
-            // Skip empty layers
-            if width == 0 || height == 0 { continue; }
-
-            // Extract opacity and visibility
+            let l_x = layer.layer_left() as f64;
+            let l_y = layer.layer_top() as f64;
             let opacity = layer.opacity() as f64 / 255.0;
             let visible = layer.visible();
 
-            // Extract blend mode via Debug format since we can't import enum directly
-            let blend_mode_str = format!("{:?}", layer.blend_mode());
-            let blend_mode = match blend_mode_str.as_str() {
+            let blend_mode = match layer.blend_mode() {
                  "Normal" => "source-over",
                  "Multiply" => "multiply",
                  "Screen" => "screen",
@@ -723,418 +1370,144 @@ impl VectorEngine {
                  _ => "source-over",
             }.to_string();
 
-            let rgba = layer.rgba();
-            if let Some(img_buffer) = RgbaImage::from_raw(width, height, rgba) {
-                let dyn_img = DynamicImage::ImageRgba8(img_buffer);
-                let mut png_bytes: Vec<u8> = Vec::new();
-                if dyn_img.write_to(&mut Cursor::new(&mut png_bytes), ImageOutputFormat::Png).is_ok() {
-                    let id = self.next_id;
-                    self.next_id += 1;
+            match layer.layer_type() {
+                psd::PsdLayerType::FolderOpen | psd::PsdLayerType::FolderClosed => {
+                    group_stack.push(Vec::new());
+                    // We store the group info in a temporary object if we wanted to build a real tree
+                    // For now, we'll just keep track of depth
+                }
+                psd::PsdLayerType::SectionDivider => {
+                    if group_stack.len() > 1 {
+                        let children = group_stack.pop().unwrap();
+                        // Flatten for now or handle group object
+                    }
+                }
+                psd::PsdLayerType::Normal => {
+                    if l_width > 0 && l_height > 0 {
+                        let rgba = layer.rgba();
+                        if let Some(img_buffer) = RgbaImage::from_raw(l_width, l_height, rgba.clone()) {
+                            let dyn_img = DynamicImage::ImageRgba8(img_buffer);
+                            let mut png_bytes: Vec<u8> = Vec::new();
+                            if let Ok(_) = dyn_img.write_to(&mut Cursor::new(&mut png_bytes), ImageOutputFormat::Png) {
+                                let id = self.next_id;
+                                self.next_id += 1;
 
-                    let obj = VectorObject {
-                        id,
-                        shape_type: ShapeType::Image,
-                        name: name.clone(),
-                        x: layer.layer_left() as f64,
-                        y: layer.layer_top() as f64,
-                        width: width as f64,
-                        height: height as f64,
-                        rotation: 0.0,
-                        fill: "".to_string(),
-                        stroke: "".to_string(),
-                        stroke_width: 0.0,
-                        opacity,
-                        visible, 
-                        locked: false,
-                        blend_mode,
-                        stroke_cap: "butt".to_string(),
-                        stroke_join: "miter".to_string(),
-                        stroke_dash: Vec::new(),
-                        sides: 4,
-                        inner_radius: 0.0,
-                        corner_radius: 0.0,
-                        path_data: String::new(),
-                        brush_id: 0,
-                        stroke_points: Vec::new(),
-                        text_content: String::new(),
-                        font_family: "Inter, sans-serif".to_string(),
-                        font_size: 24.0,
-                        font_weight: "normal".to_string(),
-                        text_align: "left".to_string(),
-                        shadow_color: "transparent".to_string(),
-                        shadow_blur: 0.0,
-                        shadow_offset_x: 0.0,
-                        shadow_offset_y: 0.0,
-                        sx: 0.0,
-                        sy: 0.0,
-                        sw: width as f64,
-                        sh: height as f64,
-                        brightness: 1.0,
-                        contrast: 1.0,
-                        saturate: 1.0,
-                        hue_rotate: 0.0,
-                        blur: 0.0,
-                        grayscale: 0.0,
-                        sepia: 0.0,
-                        invert: 0.0,
-                        raw_image: Some(png_bytes.clone()),
-                        image: None,
-                        fill_gradient: None,
-                        stroke_gradient: None,
-                        children: None,
-                    };
-                    
-                    self.objects.push(obj.clone());
-                    
-                    // For the frontend, we add the data_url to the JSON
-                    let b64 = general_purpose::STANDARD.encode(&png_bytes);
-                    let data_url = format!("data:image/png;base64,{}", b64);
-                    let mut obj_json = serde_json::to_value(&obj).unwrap();
-                    obj_json["image_data_url"] = serde_json::Value::String(data_url);
-                    imported_objects.push(obj_json);
+                                let mut obj = self.create_default_object(id, ShapeType::Image, l_x, l_y, l_width as f64, l_height as f64);
+                                obj.name = name;
+                                obj.opacity = opacity;
+                                obj.visible = visible;
+                                obj.blend_mode = blend_mode;
+                                obj.raw_image = Some(png_bytes.clone());
+                                obj.raw_rgba = Some(rgba.clone());
+                                obj.raw_rgba_width = l_width;
+                                obj.raw_rgba_height = l_height;
+                                
+                                self.objects.push(obj.clone());
+                                
+                                let b64 = general_purpose::STANDARD.encode(&png_bytes);
+                                let data_url = format!("data:image/png;base64,{}", b64);
+                                let mut obj_json = serde_json::to_value(&obj).unwrap();
+                                obj_json["image_data_url"] = serde_json::Value::String(data_url);
+                                imported_objects.push(obj_json);
+                            }
+                        }
+                    }
                 }
             }
         }
         
-        serde_json::to_string(&imported_objects).unwrap_or("[]".to_string())
+        let response = serde_json::json!({
+            "width": width,
+            "height": height,
+            "objects": imported_objects
+        });
+
+        serde_json::to_string(&response).unwrap_or("{\"error\": \"Serialization failed\"}".to_string())
+    }
+
+    pub fn export_psd(&self) -> Vec<u8> {
+        let mut layers = Vec::new();
+        for obj in &self.objects {
+            if let Some(rgba) = &obj.raw_rgba {
+                layers.push(psd::PsdLayer {
+                    name: obj.name.clone(),
+                    top: obj.y as i32,
+                    left: obj.x as i32,
+                    bottom: (obj.y + obj.height) as i32,
+                    right: (obj.x + obj.width) as i32,
+                    width: obj.raw_rgba_width,
+                    height: obj.raw_rgba_height,
+                    opacity: (obj.opacity * 255.0) as u8,
+                    visible: obj.visible,
+                    blend_mode: match obj.blend_mode.as_str() {
+                        "multiply" => "Multiply".to_string(),
+                        "screen" => "Screen".to_string(),
+                        "overlay" => "Overlay".to_string(),
+                        "darken" => "Darken".to_string(),
+                        "lighten" => "Lighten".to_string(),
+                        "color-dodge" => "ColorDodge".to_string(),
+                        "color-burn" => "ColorBurn".to_string(),
+                        "hard-light" => "HardLight".to_string(),
+                        "soft-light" => "SoftLight".to_string(),
+                        "difference" => "Difference".to_string(),
+                        "exclusion" => "Exclusion".to_string(),
+                        "hue" => "Hue".to_string(),
+                        "saturation" => "Saturation".to_string(),
+                        "color" => "Color".to_string(),
+                        "luminosity" => "Luminosity".to_string(),
+                        _ => "Normal".to_string(),
+                    },
+                    rgba: rgba.clone(),
+                    layer_type: psd::PsdLayerType::Normal,
+                });
+            }
+        }
+
+        let total_pixels = (self.artboard.width * self.artboard.height) as usize;
+        let mut composite_rgba = vec![255u8; total_pixels * 4];
+        // Fill background color
+        if let Ok(color) = u32::from_str_radix(self.artboard.background.trim_start_matches('#'), 16) {
+            let r = ((color >> 16) & 0xff) as u8;
+            let g = ((color >> 8) & 0xff) as u8;
+            let b = (color & 0xff) as u8;
+            for i in 0..total_pixels {
+                composite_rgba[i * 4] = r;
+                composite_rgba[i * 4 + 1] = g;
+                composite_rgba[i * 4 + 2] = b;
+                composite_rgba[i * 4 + 3] = 255;
+            }
+        }
+
+        let psd = psd::Psd {
+            width: self.artboard.width as u32,
+            height: self.artboard.height as u32,
+            layers,
+            composite_rgba,
+            color_mode: psd::ColorMode::Rgb,
+        };
+
+        psd.to_bytes().unwrap_or_default()
+    }
+
+    pub fn export_ai(&self) -> Vec<u8> {
+        ai::Ai::export(self.artboard.width, self.artboard.height, &self.objects)
     }
 
     fn import_ai(&mut self, data: &[u8]) -> String {
-        let doc = match Document::load_mem(data) {
-             Ok(d) => d,
-             Err(_) => return "{\"error\": \"Failed to parse AI/PDF file\"}".to_string(),
-        };
-        
-        let pages = doc.get_pages();
-        if pages.is_empty() {
-             return "{\"error\": \"No pages found in AI file\"}".to_string();
-        }
-        let page_id = *pages.values().next().unwrap();
-        
-        let content_data = match doc.get_page_content(page_id) {
-            Ok(c) => c,
-            Err(_) => return "{\"error\": \"Failed to get page content\"}".to_string(),
-        };
-        
-        let content = match Content::decode(&content_data) {
-             Ok(c) => c,
-             Err(_) => return "{\"error\": \"Failed to decode page content\"}".to_string(),
-        };
-        
-        #[derive(Clone)]
-        struct GraphicsState {
-             transform: Affine,
-             stroke_width: f64,
-             stroke: String,
-             fill: String,
-             stroke_cap: String,
-             stroke_join: String,
-             stroke_dash: Vec<f64>,
-        }
-
-        impl Default for GraphicsState {
-             fn default() -> Self {
-                 GraphicsState {
-                     transform: Affine::IDENTITY,
-                     stroke_width: 1.0,
-                     stroke: "#000000".to_string(),
-                     fill: "#000000".to_string(),
-                     stroke_cap: "butt".to_string(),
-                     stroke_join: "miter".to_string(),
-                     stroke_dash: Vec::new(),
-                 }
-             }
-        }
-
-        let mut state_stack = vec![GraphicsState::default()];
-        let mut imported_objects = Vec::new();
-        let mut current_path = String::new();
-        let mut last_x = 0.0;
-        let mut last_y = 0.0;
-        
-        fn get_nums(objs: &[lopdf::Object]) -> Vec<f64> {
-            objs.iter().filter_map(|o| match o {
-                lopdf::Object::Real(f) => Some(*f as f64),
-                lopdf::Object::Integer(i) => Some(*i as f64),
-                _ => None
-            }).collect()
-        }
-
-        fn to_color(nums: &[f64]) -> String {
-             if nums.len() == 1 {
-                 let v = (nums[0] * 255.0) as u8;
-                 format!("#{:02x}{:02x}{:02x}", v, v, v)
-             } else if nums.len() == 3 {
-                 let r = (nums[0] * 255.0) as u8;
-                 let g = (nums[1] * 255.0) as u8;
-                 let b = (nums[2] * 255.0) as u8;
-                 format!("#{:02x}{:02x}{:02x}", r, g, b)
-             } else if nums.len() == 4 {
-                 let c = nums[0]; let m = nums[1]; let y = nums[2]; let k = nums[3];
-                 let r = ((1.0 - c) * (1.0 - k) * 255.0) as u8;
-                 let g = ((1.0 - m) * (1.0 - k) * 255.0) as u8;
-                 let b = ((1.0 - y) * (1.0 - k) * 255.0) as u8;
-                 format!("#{:02x}{:02x}{:02x}", r, g, b)
-             } else {
-                 "#000000".to_string()
-             }
-        }
-        
-        for operation in content.operations.iter() {
-            let op = operation.operator.as_str();
-            let args = &operation.operands;
-            let nums = get_nums(args);
-            
-            // Get current state
-            let current_state = state_stack.last_mut().unwrap();
-
-            match op {
-                "q" => { // Push state
-                     state_stack.push(state_stack.last().unwrap().clone());
-                },
-                "Q" => { // Pop state
-                     if state_stack.len() > 1 {
-                         state_stack.pop();
-                     }
-                },
-                "cm" => { // Concatenate matrix
-                     if nums.len() >= 6 {
-                         // PDF matrix: [a b c d e f]
-                         let mat = Affine::new([nums[0], nums[1], nums[2], nums[3], nums[4], nums[5]]);
-                         current_state.transform = current_state.transform * mat;
-                     }
-                },
-                "m" => {
-                    if nums.len() >= 2 {
-                        current_path.push_str(&format!("M {} {} ", nums[0], -nums[1]));
-                        last_x = nums[0]; last_y = nums[1];
-                    }
-                },
-                "l" => {
-                    if nums.len() >= 2 {
-                        current_path.push_str(&format!("L {} {} ", nums[0], -nums[1]));
-                        last_x = nums[0]; last_y = nums[1];
-                    }
-                },
-                "c" => {
-                    if nums.len() >= 6 {
-                         current_path.push_str(&format!("C {} {}, {} {}, {} {} ", nums[0], -nums[1], nums[2], -nums[3], nums[4], -nums[5]));
-                         last_x = nums[4]; last_y = nums[5];
-                    }
-                },
-                "v" => {
-                    if nums.len() >= 4 {
-                         current_path.push_str(&format!("C {} {}, {} {}, {} {} ", last_x, -last_y, nums[0], -nums[1], nums[2], -nums[3]));
-                         last_x = nums[2]; last_y = nums[3];
-                    }
-                },
-                "y" => {
-                    if nums.len() >= 4 {
-                         current_path.push_str(&format!("C {} {}, {} {}, {} {} ", nums[0], -nums[1], nums[2], -nums[3], nums[2], -nums[3]));
-                         last_x = nums[2]; last_y = nums[3];
-                    }
-                },
-                "h" => {
-                    current_path.push_str("Z ");
-                },
-                "re" => {
-                    if nums.len() >= 4 {
-                        let (x, y, w, h) = (nums[0], nums[1], nums[2], nums[3]);
-                        current_path.push_str(&format!("M {} {} ", x, -y));
-                        current_path.push_str(&format!("L {} {} ", x + w, -y));
-                        current_path.push_str(&format!("L {} {} ", x + w, -(y + h)));
-                        current_path.push_str(&format!("L {} {} ", x, -(y + h)));
-                        current_path.push_str("Z ");
-                    }
-                },
-                "w" => { if !nums.is_empty() { current_state.stroke_width = nums[0]; } },
-                "rg" | "k" | "g" => { current_state.fill = to_color(&nums); },
-                "RG" | "K" | "G" => { current_state.stroke = to_color(&nums); },
-                "J" => { // Line Cap
-                    if !nums.is_empty() {
-                        current_state.stroke_cap = match nums[0] as i32 {
-                            0 => "butt",
-                            1 => "round",
-                            2 => "square",
-                            _ => "butt",
-                        }.to_string();
-                    }
-                },
-                "j" => { // Line Join
-                    if !nums.is_empty() {
-                         current_state.stroke_join = match nums[0] as i32 {
-                             0 => "miter",
-                             1 => "round",
-                             2 => "bevel",
-                             _ => "miter",
-                         }.to_string();
-                    }
-                },
-                "d" => { // Dash [array] phase
-                     if args.len() >= 1 {
-                         if let lopdf::Object::Array(arr) = &args[0] {
-                             current_state.stroke_dash = get_nums(arr);
-                         } else {
-                             current_state.stroke_dash = Vec::new(); // empty array = solid
-                         }
-                     }
-                },
-                
-                "S" | "s" => {
-                    if !current_path.is_empty() {
-                        if let Ok(mut bez) = BezPath::from_svg(&current_path) {
-                            let transform = current_state.transform;
-                            bez.apply_affine(transform);
-                            
-                            let rect = bez.bounding_box();
-                            let x = rect.x0; let y = rect.y0;
-                            let w = rect.width(); let h = rect.height();
-                            bez.apply_affine(Affine::translate((-x, -y)));
-                            let new_path = bez.to_svg();
-
-                            let id = self.next_id; self.next_id += 1;
-                            
-                            // Capture state
-                            let s = state_stack.last().unwrap();
-                            
-                            imported_objects.push(VectorObject {
-                                id, shape_type: ShapeType::Path, name: format!("Path {}", id),
-                                x, y, width: w, height: h,
-                                rotation: 0.0, fill: "transparent".to_string(),
-                                stroke: s.stroke.clone(), stroke_width: s.stroke_width,
-                                stroke_cap: s.stroke_cap.clone(), stroke_join: s.stroke_join.clone(),
-                                stroke_dash: s.stroke_dash.clone(),
-                                blend_mode: "source-over".to_string(),
-                                opacity: 1.0, visible: true, locked: false,
-                                sides: 0, inner_radius: 0.0, corner_radius: 0.0,
-                                path_data: new_path,
-                                brush_id: 0,
-                                stroke_points: Vec::new(),
-                                text_content: String::new(),
-                                font_family: "Inter, sans-serif".to_string(),
-                                font_size: 24.0,
-                                font_weight: "normal".to_string(),
-                                text_align: "left".to_string(),
-                                shadow_color: "transparent".to_string(),
-                                shadow_blur: 0.0,
-                                shadow_offset_x: 0.0,
-                                shadow_offset_y: 0.0,
-                                sx: 0.0, sy: 0.0, sw: 0.0, sh: 0.0,
-                                brightness: 1.0, contrast: 1.0, saturate: 1.0, hue_rotate: 0.0, blur: 0.0,
-                                grayscale: 0.0, sepia: 0.0, invert: 0.0,
-                                raw_image: None, image: None,
-                                fill_gradient: None, stroke_gradient: None, children: None,
-                            });
-                        }
-                        current_path.clear();
-                    }
-                },
-                "f" | "F" | "f*" => {
-                    if !current_path.is_empty() {
-                         if let Ok(mut bez) = BezPath::from_svg(&current_path) {
-                            let transform = current_state.transform;
-                            bez.apply_affine(transform);
-
-                            let rect = bez.bounding_box();
-                            let x = rect.x0; let y = rect.y0;
-                            let w = rect.width(); let h = rect.height();
-                            bez.apply_affine(Affine::translate((-x, -y)));
-                            let new_path = bez.to_svg();
-
-                            let id = self.next_id; self.next_id += 1;
-                            let s = state_stack.last().unwrap();
-
-                            imported_objects.push(VectorObject {
-                                id, shape_type: ShapeType::Path, name: format!("Path {}", id),
-                                x, y, width: w, height: h,
-                                rotation: 0.0, fill: s.fill.clone(),
-                                stroke: "transparent".to_string(), stroke_width: 0.0,
-                                stroke_cap: s.stroke_cap.clone(), stroke_join: s.stroke_join.clone(),
-                                stroke_dash: s.stroke_dash.clone(),
-                                blend_mode: "source-over".to_string(),
-                                opacity: 1.0, visible: true, locked: false,
-                                sides: 0, inner_radius: 0.0, corner_radius: 0.0,
-                                path_data: new_path,
-                                brush_id: 0,
-                                stroke_points: Vec::new(),
-                                text_content: String::new(),
-                                font_family: "Inter, sans-serif".to_string(),
-                                font_size: 24.0,
-                                font_weight: "normal".to_string(),
-                                text_align: "left".to_string(),
-                                shadow_color: "transparent".to_string(),
-                                shadow_blur: 0.0,
-                                shadow_offset_x: 0.0,
-                                shadow_offset_y: 0.0,
-                                sx: 0.0, sy: 0.0, sw: 0.0, sh: 0.0,
-                                brightness: 1.0, contrast: 1.0, saturate: 1.0, hue_rotate: 0.0, blur: 0.0,
-                                grayscale: 0.0, sepia: 0.0, invert: 0.0,
-                                raw_image: None, image: None,
-                                fill_gradient: None, stroke_gradient: None, children: None,
-                            });
-                        }
-                        current_path.clear();
-                    }
-                },
-                "B" | "B*" | "b" | "b*" => {
-                    if !current_path.is_empty() {
-                         if let Ok(mut bez) = BezPath::from_svg(&current_path) {
-                            let transform = current_state.transform;
-                            bez.apply_affine(transform);
-                             
-                            let rect = bez.bounding_box();
-                            let x = rect.x0; let y = rect.y0;
-                            let w = rect.width(); let h = rect.height();
-                            bez.apply_affine(Affine::translate((-x, -y)));
-                            let new_path = bez.to_svg();
-
-                            let id = self.next_id; self.next_id += 1;
-                            let s = state_stack.last().unwrap();
-                            
-                            imported_objects.push(VectorObject {
-                                id, shape_type: ShapeType::Path, name: format!("Path {}", id),
-                                x, y, width: w, height: h,
-                                rotation: 0.0, fill: s.fill.clone(),
-                                stroke: s.stroke.clone(), stroke_width: s.stroke_width,
-                                stroke_cap: s.stroke_cap.clone(), stroke_join: s.stroke_join.clone(),
-                                stroke_dash: s.stroke_dash.clone(),
-                                blend_mode: "source-over".to_string(),
-                                opacity: 1.0, visible: true, locked: false,
-                                sides: 0, inner_radius: 0.0, corner_radius: 0.0,
-                                path_data: new_path,
-                                brush_id: 0,
-                                stroke_points: Vec::new(),
-                                text_content: String::new(),
-                                font_family: "Inter, sans-serif".to_string(),
-                                font_size: 24.0,
-                                font_weight: "normal".to_string(),
-                                text_align: "left".to_string(),
-                                shadow_color: "transparent".to_string(),
-                                shadow_blur: 0.0,
-                                shadow_offset_x: 0.0,
-                                shadow_offset_y: 0.0,
-                                sx: 0.0, sy: 0.0, sw: 0.0, sh: 0.0,
-                                brightness: 1.0, contrast: 1.0, saturate: 1.0, hue_rotate: 0.0, blur: 0.0,
-                                grayscale: 0.0, sepia: 0.0, invert: 0.0,
-                                raw_image: None, image: None,
-                                fill_gradient: None, stroke_gradient: None, children: None,
-                            });
-                        }
-                        current_path.clear();
-                    }
-                },
-                "n" => { current_path.clear(); },
-                _ => {}
+        let mut parser = AiParser::new(data);
+        match parser.parse() {
+            Ok(ai) => {
+                for obj in &ai.objects {
+                    self.objects.push(obj.clone());
+                }
+                let response = serde_json::json!({
+                    "width": ai.width,
+                    "height": ai.height,
+                    "objects": ai.objects
+                });
+                serde_json::to_string(&response).unwrap_or("{\"error\": \"Serialization failed\"}".to_string())
             }
-        }
-        
-        for obj in &imported_objects {
-            self.objects.push(obj.clone());
-        }
-
-        match serde_json::to_string(&imported_objects) {
-             Ok(s) => s,
-             Err(_) => "[]".to_string(),
+            Err(e) => format!("{{\"error\": \"Failed to parse AI: {:?}\"}}", e),
         }
     }
 
@@ -1160,6 +1533,9 @@ impl VectorEngine {
             stroke_cap: "butt".to_string(),
             stroke_join: "miter".to_string(),
             stroke_dash: Vec::new(),
+            layer_style: LayerStyle::default(),
+            mask_id: None,
+            is_mask: false,
             sides: 5,
             inner_radius: 0.5,
             corner_radius: 0.0,
@@ -1171,6 +1547,9 @@ impl VectorEngine {
             font_size: 24.0,
             font_weight: "normal".to_string(),
             text_align: "left".to_string(),
+            kerning: 0.0,
+            leading: 1.2,
+            tracking: 0.0,
             shadow_color: "transparent".to_string(),
             shadow_blur: 0.0,
             shadow_offset_x: 0.0,
@@ -1188,6 +1567,9 @@ impl VectorEngine {
             sepia: 0.0,
             invert: 0.0,
             raw_image: None,
+            raw_rgba: None,
+            raw_rgba_width: 0,
+            raw_rgba_height: 0,
             image: None,
             fill_gradient: None,
             stroke_gradient: None,
@@ -1294,10 +1676,20 @@ impl VectorEngine {
             if let Some(v) = params["font_size"].as_f64() { obj.font_size = v; }
             if let Some(v) = params["font_weight"].as_str() { obj.font_weight = v.to_string(); }
             if let Some(v) = params["text_align"].as_str() { obj.text_align = v.to_string(); }
+            if let Some(v) = params["kerning"].as_f64() { obj.kerning = v; }
+            if let Some(v) = params["leading"].as_f64() { obj.leading = v; }
+            if let Some(v) = params["tracking"].as_f64() { obj.tracking = v; }
             if let Some(v) = params["shadow_color"].as_str() { obj.shadow_color = v.to_string(); }
             if let Some(v) = params["shadow_blur"].as_f64() { obj.shadow_blur = v; }
             if let Some(v) = params["shadow_offset_x"].as_f64() { obj.shadow_offset_x = v; }
             if let Some(v) = params["shadow_offset_y"].as_f64() { obj.shadow_offset_y = v; }
+            if let Some(v) = params["is_mask"].as_bool() { obj.is_mask = v; }
+            if let Some(v) = params["mask_id"].as_u64() { obj.mask_id = Some(v as u32); }
+            if let Some(style_val) = params.get("layer_style") {
+                if let Ok(style) = serde_json::from_value::<LayerStyle>(style_val.clone()) {
+                    obj.layer_style = style;
+                }
+            }
             true
         } else {
             false
@@ -1454,9 +1846,164 @@ impl VectorEngine {
     // It's safer to remove and fix calls to ensure I found all usages.
 
 
+    pub fn erase_image(&mut self, id: u32, x: f64, y: f64, radius: f64) -> bool {
+        if let Some(obj) = self.objects.iter_mut().find(|o| o.id == id) {
+            if obj.shape_type != ShapeType::Image { return false; }
+            
+            let pixels = match &mut obj.raw_rgba {
+                Some(p) => p,
+                None => return false,
+            };
+
+            let width = obj.raw_rgba_width as f64;
+            let height = obj.raw_rgba_height as f64;
+
+            // Map world x, y to local image pixels
+            let cx = obj.x + obj.width / 2.0;
+            let cy = obj.y + obj.height / 2.0;
+            let dx = x - cx;
+            let dy = y - cy;
+
+            let cos_r = (-obj.rotation).cos();
+            let sin_r = (-obj.rotation).sin();
+            let lx = dx * cos_r - dy * sin_r;
+            let ly = dx * sin_r + dy * cos_r;
+
+            let px = (lx / obj.width + 0.5) * width;
+            let py = (ly / obj.height + 0.5) * height;
+            
+            let scale_x = width / obj.width;
+            let scale_y = height / obj.height;
+            let p_radius = radius * (scale_x + scale_y) / 2.0;
+
+            let r2 = p_radius * p_radius;
+            let i_width = obj.raw_rgba_width as i32;
+            let i_height = obj.raw_rgba_height as i32;
+
+            let min_px = (px - p_radius).floor() as i32;
+            let max_px = (px + p_radius).ceil() as i32;
+            let min_py = (py - p_radius).floor() as i32;
+            let max_py = (py + p_radius).ceil() as i32;
+
+            let mut modified = false;
+            for iy in min_py..max_py {
+                if iy < 0 || iy >= i_height { continue; }
+                for ix in min_px..max_px {
+                    if ix < 0 || ix >= i_width { continue; }
+                    
+                    let dx_p = ix as f64 - px;
+                    let dy_p = iy as f64 - py;
+                    if dx_p*dx_p + dy_p*dy_p <= r2 {
+                        let idx = (iy * i_width + ix) as usize * 4;
+                        if pixels[idx + 3] != 0 {
+                            pixels[idx + 3] = 0;
+                            modified = true;
+                        }
+                    }
+                }
+            }
+            return modified;
+        }
+        false
+    }
+
+    pub fn clone_stamp(&mut self, id: u32, src_x: f64, src_y: f64, dst_x: f64, dst_y: f64, radius: f64) -> bool {
+        if let Some(obj) = self.objects.iter_mut().find(|o| o.id == id) {
+            if obj.shape_type != ShapeType::Image { return false; }
+            
+            let width = obj.raw_rgba_width;
+            let height = obj.raw_rgba_height;
+            let o_x = obj.x;
+            let o_y = obj.y;
+            let o_w = obj.width;
+            let o_h = obj.height;
+            let o_rot = obj.rotation;
+
+            // Map world src/dst to local image pixels
+            let to_local = |wx: f64, wy: f64| {
+                let cx = o_x + o_w / 2.0;
+                let cy = o_y + o_h / 2.0;
+                let dx = wx - cx;
+                let dy = wy - cy;
+                let cos_r = (-o_rot).cos();
+                let sin_r = (-o_rot).sin();
+                let lx = dx * cos_r - dy * sin_r;
+                let ly = dx * sin_r + dy * cos_r;
+                (
+                    ((lx / o_w + 0.5) * width as f64) as i32,
+                    ((ly / o_h + 0.5) * height as f64) as i32
+                )
+            };
+
+            let (lsx, lsy) = to_local(src_x, src_y);
+            let (ldx, ldy) = to_local(dst_x, dst_y);
+            
+            let scale_x = width as f64 / o_w;
+            let p_radius = (radius * scale_x) as i32;
+            let r2 = p_radius * p_radius;
+
+            let pixels = match &mut obj.raw_rgba {
+                Some(p) => p,
+                None => return false,
+            };
+
+            let i_width = width as i32;
+            let i_height = height as i32;
+            let mut modified = false;
+            let mut new_pixels = pixels.clone();
+
+            for dy in -p_radius..p_radius {
+                for dx in -p_radius..p_radius {
+                    if dx*dx + dy*dy <= r2 {
+                        let sx = lsx + dx;
+                        let sy = lsy + dy;
+                        let tx = ldx + dx;
+                        let ty = ldy + dy;
+
+                        if sx >= 0 && sx < i_width && sy >= 0 && sy < i_height &&
+                           tx >= 0 && tx < i_width && ty >= 0 && ty < i_height {
+                            let src_idx = (sy * i_width + sx) as usize * 4;
+                            let dst_idx = (ty * i_width + tx) as usize * 4;
+                            
+                            new_pixels[dst_idx] = pixels[src_idx];
+                            new_pixels[dst_idx+1] = pixels[src_idx+1];
+                            new_pixels[dst_idx+2] = pixels[src_idx+2];
+                            new_pixels[dst_idx+3] = pixels[src_idx+3];
+                            modified = true;
+                        }
+                    }
+                }
+            }
+            
+            if modified {
+                *pixels = new_pixels;
+            }
+            return modified;
+        }
+        false
+    }
+
+    pub fn get_image_rgba(&self, id: u32) -> Option<Vec<u8>> {
+        self.objects.iter().find(|o| o.id == id).and_then(|o| o.raw_rgba.clone())
+    }
+
+    pub fn get_image_width(&self, id: u32) -> u32 {
+        self.objects.iter().find(|o| o.id == id).map(|o| o.raw_rgba_width).unwrap_or(0)
+    }
+
+    pub fn get_image_height(&self, id: u32) -> u32 {
+        self.objects.iter().find(|o| o.id == id).map(|o| o.raw_rgba_height).unwrap_or(0)
+    }
+
     pub fn set_image_raw(&mut self, id: u32, data: Vec<u8>) -> bool {
         if let Some(obj) = self.objects.iter_mut().find(|o| o.id == id) {
-            obj.raw_image = Some(data);
+            obj.raw_image = Some(data.clone());
+            if let Ok(img) = image::load_from_memory(&data) {
+                let rgba = img.to_rgba8();
+                obj.raw_rgba_width = rgba.width();
+                obj.raw_rgba_height = rgba.height();
+                obj.raw_rgba = Some(rgba.into_raw());
+            }
             true
         } else {
             false
@@ -1467,12 +2014,17 @@ impl VectorEngine {
         serde_json::to_string(&self.objects).unwrap_or_else(|_| "[]".to_string())
     }
 
-    pub fn set_image_object(&mut self, id: u32, image: HtmlImageElement) -> bool {
+    pub fn set_image_object(&mut self, id: u32, image_val: JsValue) -> bool {
         if let Some(obj) = self.objects.iter_mut().find(|o| o.id == id) {
-            if obj.sw == 0.0 { obj.sw = image.width() as f64; }
-            if obj.sh == 0.0 { obj.sh = image.height() as f64; }
-            obj.image = Some(image);
-            obj.raw_image = None; // Free memory after image is converted to browser object
+            if let Some(image) = image_val.dyn_ref::<HtmlImageElement>() {
+                if obj.sw == 0.0 { obj.sw = image.width() as f64; }
+                if obj.sh == 0.0 { obj.sh = image.height() as f64; }
+            } else if let Some(canvas) = image_val.dyn_ref::<web_sys::HtmlCanvasElement>() {
+                if obj.sw == 0.0 { obj.sw = canvas.width() as f64; }
+                if obj.sh == 0.0 { obj.sh = canvas.height() as f64; }
+            }
+            obj.image = Some(image_val);
+            // obj.raw_image = None; // REMOVED: Keep raw_image for potential erases/vectorization
             true
         } else {
             false
@@ -1498,10 +2050,20 @@ impl VectorEngine {
         ctx.set_shadow_color("rgba(0,0,0,0.5)");
         ctx.set_shadow_blur(20.0);
         ctx.fill_rect(0.0, 0.0, self.artboard.width, self.artboard.height);
+        ctx.set_shadow_color("transparent");
+
+        // If bottom layer is a locked image, draw checkers first
+        if let Some(first) = self.objects.first() {
+            if first.shape_type == ShapeType::Image && first.locked {
+                self.render_checkerboard(ctx, self.artboard.width, self.artboard.height);
+            }
+        }
 
         for obj in &self.objects {
             self.render_object(ctx, obj);
         }
+        
+        self.render_guides(ctx);
         ctx.restore();
         
         // Render Selection Overlay
@@ -1509,6 +2071,26 @@ impl VectorEngine {
             self.render_selection_overlay(ctx);
         }
 
+        ctx.restore();
+    }
+
+    fn render_checkerboard(&self, ctx: &web_sys::CanvasRenderingContext2d, width: f64, height: f64) {
+        let size = 16.0;
+        ctx.save();
+        ctx.set_fill_style(&JsValue::from_str("#ffffff"));
+        ctx.fill_rect(0.0, 0.0, width, height);
+        ctx.set_fill_style(&JsValue::from_str("#e5e5e5"));
+        
+        let cols = (width / size).ceil() as i32;
+        let rows = (height / size).ceil() as i32;
+        
+        for r in 0..rows {
+            for c in 0..cols {
+                if (r + c) % 2 != 0 {
+                    ctx.fill_rect(c as f64 * size, r as f64 * size, size, size);
+                }
+            }
+        }
         ctx.restore();
     }
 
@@ -1593,15 +2175,42 @@ impl VectorEngine {
     }
 
     fn render_object(&self, ctx: &web_sys::CanvasRenderingContext2d, obj: &VectorObject) {
-        if !obj.visible { return; }
+        if !obj.visible || obj.is_mask { return; }
         
         ctx.save();
+
+        // 1. Handle Masking
+        if let Some(mask_id) = obj.mask_id {
+            if let Some(mask_obj) = self.objects.iter().find(|o| o.id == mask_id) {
+                // To mask, we first draw the mask shape to define the path, then clip
+                ctx.save();
+                // Move to mask's transform
+                ctx.translate(mask_obj.x + mask_obj.width / 2.0, mask_obj.y + mask_obj.height / 2.0).unwrap();
+                ctx.rotate(mask_obj.rotation).unwrap();
+                ctx.translate(-mask_obj.width / 2.0, -mask_obj.height / 2.0).unwrap();
+                
+                self.define_object_path(ctx, mask_obj);
+                ctx.restore();
+                ctx.clip();
+            }
+        }
+
         ctx.set_global_alpha(obj.opacity);
         ctx.set_global_composite_operation(&obj.blend_mode).unwrap_or(());
         
-        // Apply Filters
-        if obj.shape_type == ShapeType::Image {
-             let filter = format!(
+        // 2. Apply Adjustment logic if it's an adjustment layer
+        if obj.shape_type == ShapeType::Adjustment {
+            // Adjustment layers in this engine will affect the WHOLE canvas below them
+            // because of how we render sequentially.
+            // We'll apply filters to the context that will persist for subsequent draws
+            // but we need a way to "scope" them. 
+            // For now, let's say they affect everything rendered SO FAR or everything AFTER.
+            // In Photoshop, they affect layers BELOW. 
+            // Since we render bottom-to-top, an adjustment layer at index N should affect
+            // the result of layers 0..N-1.
+            // This requires rendering 0..N-1 to a temp canvas, applying filter, then continuing.
+            // Simplification for now: Adjustment layers apply a global filter to the ctx.
+            let filter = format!(
                 "brightness({}%) contrast({}%) saturate({}%) hue-rotate({}deg) blur({}px) grayscale({}%) sepia({}%) invert({}%)",
                 obj.brightness * 100.0,
                 obj.contrast * 100.0,
@@ -1613,12 +2222,28 @@ impl VectorEngine {
                 obj.invert * 100.0
             );
             ctx.set_filter(&filter);
+            // We don't "draw" the adjustment layer itself, it just modifies the pipeline.
+            // However, we might want to draw a bounding box in the UI.
+            return;
+        }
+
+        // 3. Apply Layer Styles (FX) - PRE-DRAW (e.g. Drop Shadow)
+        for effect in &obj.layer_style.effects {
+            if !effect.enabled { continue; }
+            if effect.effect_type == EffectType::DropShadow {
+                ctx.set_shadow_color(&effect.color);
+                ctx.set_shadow_blur(effect.blur);
+                ctx.set_shadow_offset_x(effect.x);
+                ctx.set_shadow_offset_y(effect.y);
+            }
         }
         
         // Transform for object
         ctx.translate(obj.x + obj.width / 2.0, obj.y + obj.height / 2.0).unwrap();
         ctx.rotate(obj.rotation).unwrap();
         ctx.translate(-obj.width / 2.0, -obj.height / 2.0).unwrap();
+        
+        // ... rest of rendering ...
 
         // Recursively render children if Group
         if obj.shape_type == ShapeType::Group {
@@ -1724,10 +2349,16 @@ impl VectorEngine {
                     if obj.stroke_width > 0.0 { ctx.stroke(); }
                 }
                 ShapeType::Image => {
-                    if let Some(img) = &obj.image {
-                        let _ = ctx.draw_image_with_html_image_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
-                            img, obj.sx, obj.sy, obj.sw, obj.sh, 0.0, 0.0, obj.width, obj.height
-                        );
+                    if let Some(img_val) = &obj.image {
+                        if let Some(img) = img_val.dyn_ref::<web_sys::HtmlImageElement>() {
+                            let _ = ctx.draw_image_with_html_image_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
+                                img, obj.sx, obj.sy, obj.sw, obj.sh, 0.0, 0.0, obj.width, obj.height
+                            );
+                        } else if let Some(canvas) = img_val.dyn_ref::<web_sys::HtmlCanvasElement>() {
+                            let _ = ctx.draw_image_with_html_canvas_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
+                                canvas, obj.sx, obj.sy, obj.sw, obj.sh, 0.0, 0.0, obj.width, obj.height
+                            );
+                        }
                     }
                 }
                 ShapeType::Path => {
@@ -1758,6 +2389,74 @@ impl VectorEngine {
             }
         }
 
+        ctx.restore();
+    }
+
+    fn define_object_path(&self, ctx: &web_sys::CanvasRenderingContext2d, obj: &VectorObject) {
+        match obj.shape_type {
+            ShapeType::Rectangle => {
+                if obj.corner_radius > 0.0 {
+                    let r = obj.corner_radius.min(obj.width / 2.0).min(obj.height / 2.0);
+                    ctx.begin_path();
+                    ctx.move_to(r, 0.0);
+                    ctx.line_to(obj.width - r, 0.0);
+                    ctx.arc_to(obj.width, 0.0, obj.width, r, r).unwrap();
+                    ctx.line_to(obj.width, obj.height - r);
+                    ctx.arc_to(obj.width, obj.height, obj.width - r, obj.height, r).unwrap();
+                    ctx.line_to(r, obj.height);
+                    ctx.arc_to(0.0, obj.height, 0.0, obj.height - r, r).unwrap();
+                    ctx.line_to(0.0, r);
+                    ctx.arc_to(0.0, 0.0, r, 0.0, r).unwrap();
+                    ctx.close_path();
+                } else {
+                    ctx.begin_path();
+                    ctx.rect(0.0, 0.0, obj.width, obj.height);
+                }
+            }
+            ShapeType::Circle | ShapeType::Ellipse => {
+                ctx.begin_path();
+                let _ = ctx.ellipse(obj.width / 2.0, obj.height / 2.0, obj.width / 2.0, obj.height / 2.0, 0.0, 0.0, std::f64::consts::PI * 2.0);
+            }
+            ShapeType::Polygon => {
+                self.draw_poly(ctx, obj.width / 2.0, obj.height / 2.0, obj.width / 2.0, obj.sides, 0.0);
+            }
+            ShapeType::Star => {
+                self.draw_star(ctx, obj.width / 2.0, obj.height / 2.0, obj.width / 2.0, obj.inner_radius * (obj.width / 2.0), obj.sides);
+            }
+            ShapeType::Path => {
+                if !obj.path_data.is_empty() {
+                    if let Ok(p) = Path2d::new_with_path_string(&obj.path_data) {
+                        ctx.begin_path();
+                        // Path2D doesn't easily expose its segments to begin_path, 
+                        // but in many browsers calling fill/stroke with Path2D is enough.
+                        // For clipping, we might need a workaround or more complex path parsing.
+                        // web_sys doesn't have a direct way to convert Path2D back to the main path.
+                    }
+                }
+            }
+            _ => {
+                ctx.begin_path();
+                ctx.rect(0.0, 0.0, obj.width, obj.height);
+            }
+        }
+    }
+
+    fn render_guides(&self, ctx: &web_sys::CanvasRenderingContext2d) {
+        ctx.save();
+        ctx.set_stroke_style(&JsValue::from_str("cyan"));
+        ctx.set_line_width(1.0 / self.viewport_zoom);
+        
+        for guide in &self.artboard.guides {
+            ctx.begin_path();
+            if guide.orientation == "horizontal" {
+                ctx.move_to(-10000.0, guide.position);
+                ctx.line_to(10000.0, guide.position);
+            } else {
+                ctx.move_to(guide.position, -10000.0);
+                ctx.line_to(guide.position, 10000.0);
+            }
+            ctx.stroke();
+        }
         ctx.restore();
     }
 

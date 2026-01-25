@@ -1,5 +1,5 @@
 use serde::{Serialize, Deserialize};
-use kurbo::{BezPath, Point, Vec2, Shape, ParamCurve, ParamCurveArclen};
+use kurbo::{BezPath, Point, ParamCurve, ParamCurveArclen};
 use web_sys::{CanvasRenderingContext2d, HtmlImageElement};
 use wasm_bindgen::JsValue;
 

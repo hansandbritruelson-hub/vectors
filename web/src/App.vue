@@ -8,10 +8,10 @@ import {
     Star, Hexagon, Pipette, Type, Upload,
     Trash2, Copy, BringToFront, SendToBack, ChevronUp, ChevronDown,
     Pencil, Eraser, Hand, Search, RotateCw, PaintBucket, Brush,
-    Zap
+    Zap, Plus, History, Settings, Wand2, Stamp, Sparkles
 } from 'lucide-vue-next';
 
-type Tool = 'select' | 'rect' | 'circle' | 'image' | 'bezier' | 'crop' | 'star' | 'poly' | 'eyedropper' | 'text' | 'pencil' | 'brush' | 'eraser' | 'hand' | 'zoom' | 'rotate' | 'gradient' | 'vectorize';
+type Tool = 'select' | 'rect' | 'circle' | 'image' | 'bezier' | 'crop' | 'star' | 'poly' | 'eyedropper' | 'text' | 'pencil' | 'brush' | 'eraser' | 'hand' | 'zoom' | 'rotate' | 'gradient' | 'vectorize' | 'adjustment' | 'magic_wand' | 'clone_stamp';
 
 const canvas = ref<HTMLCanvasElement | null>(null);
 const canvasContainer = ref<HTMLElement | null>(null);
@@ -88,6 +88,7 @@ const activeTool = ref<Tool>('select');
 const showShapesMenu = ref(false);
 const snapMode = ref(true);
 const objects = ref<any[]>([]);
+const history = ref<string[]>([]);
 const imageMap = new Map<number, HTMLImageElement>();
 const selectedIds = ref<number[]>([]); // Changed to array
 const isDragging = ref(false);
@@ -101,8 +102,51 @@ const selectionBox = ref<{ x: number, y: number, w: number, h: number } | null>(
 const activeHandle = ref<{ id: number, type: string } | null>(null);
 
 
-watch(activeTool, () => {
-    needsRender.value = true;
+function booleanOp(operation: string) {
+  executeCommand({
+    action: 'boolean_operation',
+    params: {
+      operation,
+      ids: selectedIds.value
+    }
+  });
+}
+
+function toggleMask() {
+  if (!selectedObject.value) return;
+  const newValue = !selectedObject.value.is_mask;
+  updateSelected('is_mask', newValue);
+  
+  if (newValue) {
+    // If it becomes a mask, we might want to attach it to the layer above?
+    // In our sequential rendering, we'll just let the user set mask_id on other layers.
+  }
+}
+
+function createAdjustment() {
+  if (!engine.value) return;
+  const res = executeCommand({
+    action: 'add',
+    params: {
+      type: 'Adjustment',
+      x: 0,
+      y: 0,
+      width: artboard.value.width,
+      height: artboard.value.height,
+      save_undo: true
+    }
+  });
+  if (res && res.id) {
+    executeCommand({ action: 'select', params: { id: res.id } });
+  }
+}
+
+watch(activeTool, (newTool) => {
+  if (newTool === 'adjustment') {
+    createAdjustment();
+    activeTool.value = 'select'; // Switch back to select to tweak properties
+  }
+  needsRender.value = true;
 });
 
 watch(selectedIds, (newIds) => {
@@ -136,6 +180,61 @@ watch(messages, () => {
 
 const vectorizeThreshold = ref(128);
 const lastVectorizedResult = ref<{ sourceId: number, pathId: number } | null>(null);
+const eraserSize = ref(20);
+const magicWandTolerance = ref(30);
+const cloneSource = ref<{ x: number, y: number } | null>(null);
+const cloneSize = ref(20);
+
+function updateImageFromEngine(id: number) {
+  if (!engine.value) return;
+  const pixels = engine.value.get_image_rgba(id);
+  const width = engine.value.get_image_width(id);
+  const height = engine.value.get_image_height(id);
+  if (pixels && width && height) {
+      const tempCanvas = document.createElement('canvas');
+      tempCanvas.width = width;
+      tempCanvas.height = height;
+      const tCtx = tempCanvas.getContext('2d');
+      if (tCtx) {
+          const imageData = new ImageData(new Uint8ClampedArray(pixels), width, height);
+          tCtx.putImageData(imageData, 0, 0);
+          engine.value.set_image_object(id, tempCanvas);
+          needsRender.value = true;
+      }
+  }
+}
+
+function startGuideDrag(orientation: 'horizontal' | 'vertical') {
+    const handleMove = (e: MouseEvent) => {
+        const rect = canvas.value?.getBoundingClientRect();
+        if (!rect) return;
+        const x = e.clientX - rect.left;
+        const y = e.clientY - rect.top;
+        const worldPos = screenToWorld(x, y);
+        
+        // Render a temporary guide or just wait for up
+    };
+    const handleUp = (e: MouseEvent) => {
+        window.removeEventListener('mousemove', handleMove);
+        window.removeEventListener('mouseup', handleUp);
+        
+        const rect = canvas.value?.getBoundingClientRect();
+        if (!rect) return;
+        const x = e.clientX - rect.left;
+        const y = e.clientY - rect.top;
+        const worldPos = screenToWorld(x, y);
+        
+        executeCommand({
+            action: 'add_guide',
+            params: {
+                orientation,
+                position: orientation === 'horizontal' ? worldPos.y : worldPos.x
+            }
+        });
+    };
+    window.addEventListener('mousemove', handleMove);
+    window.addEventListener('mouseup', handleUp);
+}
 
 function vectorizeImage(saveUndo: boolean = true) {
     console.log("Frontend: Requesting vectorization with threshold:", vectorizeThreshold.value, "saveUndo:", saveUndo);
@@ -192,7 +291,7 @@ watch(vectorizeThreshold, () => {
     }, 50); // Small debounce for smoothness
 });
 
-const viewport = ref({ x: 50, y: 50, zoom: 1.0 });
+const viewport = ref({ x: 0, y: 0, zoom: 1.0 });
 const isPanning = ref(false);
 const isSpacePressed = ref(false);
 const artboard = ref({ width: 800, height: 600, background: '#ffffff' });
@@ -201,9 +300,15 @@ const showDocProps = ref(false);
 
 function screenToWorld(x: number, y: number) {
     if (!canvas.value) return { x, y };
+    // Get the actual screen position of the canvas element
+    // Since the canvas is nested and offset by rulers, we need its client rect
+    const rect = canvas.value.getBoundingClientRect();
+    const cx = x - rect.left;
+    const cy = y - rect.top;
+    
     return {
-        x: (x - viewport.value.x) / viewport.value.zoom,
-        y: (y - viewport.value.y) / viewport.value.zoom
+        x: (cx - viewport.value.x) / viewport.value.zoom,
+        y: (cy - viewport.value.y) / viewport.value.zoom
     };
 }
 
@@ -463,12 +568,15 @@ const targetImageId = computed(() => {
         return selectedObject.value.id;
     }
     // 2. If we just vectorized something, keep targeting that source
-    if (lastVectorizedResult.value && objects.value.some(o => o.id === lastVectorizedResult.value?.sourceId)) {
-        return lastVectorizedResult.value.sourceId;
+    if (lastVectorizedResult.value && objects.value.some(o => o.id === (lastVectorizedResult.value as any).sourceId)) {
+        return (lastVectorizedResult.value as any).sourceId;
     }
-    // 3. Fallback to any image
-    const bottomImage = objects.value.find(o => o.shape_type === 'Image');
-    return bottomImage ? bottomImage.id : -1;
+    // 3. Fallback to bottommost locked image
+    const lockedImages = objects.value.filter(o => o.shape_type === 'Image' && o.locked);
+    if (lockedImages.length > 0) {
+        return lockedImages[0].id;
+    }
+    return -1;
 });
 
 const activeStopWorldPos = computed(() => {
@@ -584,6 +692,12 @@ async function removeSelectedBackground() {
     }
 }
 
+async function generativeFill() {
+  const p = window.prompt("Enter prompt for generative fill:");
+  if (!p) return;
+  alert("Generative Fill is currently a placeholder. This would call a Stable Diffusion endpoint with the current selection as a mask.");
+}
+
 watch(clipToArtboard, (val) => {
     executeCommand({ action: 'set_clipping', params: { enabled: val } });
 });
@@ -599,14 +713,13 @@ onMounted(() => {
         }
         engine.value = new VectorEngine();
         updateArtboard();
-        executeCommand({ action: 'add', params: { type: 'Rectangle', x: 100, y: 100, width: 200, height: 150, fill: '#4facfe' } });
         
         window.addEventListener('resize', handleResize);
         window.addEventListener('keydown', handleKeydown);
         window.addEventListener('keyup', handleKeyup);
 
         // Init Viewport
-        engine.value.set_viewport(viewport.value.x, viewport.value.y, viewport.value.zoom);
+        zoomToFit();
 
         // Fetch Brushes
         const brushesJson = engine.value.execute_command(JSON.stringify({ action: 'get_brushes', params: {} }));
@@ -724,14 +837,33 @@ function updateArtboard() {
     showDocProps.value = false;
 }
 
+function zoomToFit() {
+    if (!canvasContainer.value || !engine.value) return;
+    const padding = 50;
+    const cw = canvasContainer.value.clientWidth;
+    const ch = canvasContainer.value.clientHeight;
+    const aw = artboard.value.width;
+    const ah = artboard.value.height;
+
+    const zoomX = (cw - padding * 2) / aw;
+    const zoomY = (ch - padding * 2) / ah;
+    const zoom = Math.min(zoomX, zoomY, 1.0);
+
+    const x = (cw - aw * zoom) / 2;
+    const y = (ch - ah * zoom) / 2;
+
+    viewport.value = { x, y, zoom };
+    engine.value.set_viewport(x, y, zoom);
+    needsRender.value = true;
+}
+
 function newDocument() {
     if (!engine.value) return;
     // We could add a clear_all command to the engine, or just re-instantiate
     engine.value = new VectorEngine();
     // Re-sync artboard and viewport
     updateArtboard();
-    viewport.value = { x: 50, y: 50, zoom: 1.0 };
-    engine.value.set_viewport(viewport.value.x, viewport.value.y, viewport.value.zoom);
+    zoomToFit();
     needsRender.value = true;
 }
 
@@ -743,6 +875,10 @@ function handleResize() {
   }
 }
 
+function reloadApp() {
+    window.location.reload();
+}
+
 function renderLoop() {
   if (!engine.value || !canvas.value) return;
   
@@ -750,6 +886,22 @@ function renderLoop() {
       const ctx = canvas.value.getContext('2d', { willReadFrequently: true });
       if (ctx) {
         engine.value.render(ctx);
+
+        // Draw Eraser Cursor
+        if (activeTool.value === 'eraser' && lastMousePos.value && targetImageId.value !== -1) {
+            ctx.save();
+            ctx.beginPath();
+            ctx.arc(lastMousePos.value.x, lastMousePos.value.y, eraserSize.value * viewport.value.zoom, 0, Math.PI * 2);
+            ctx.strokeStyle = 'white';
+            ctx.lineWidth = 1;
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.arc(lastMousePos.value.x, lastMousePos.value.y, (eraserSize.value * viewport.value.zoom) - 1, 0, Math.PI * 2);
+            ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+            ctx.setLineDash([2, 2]);
+            ctx.stroke();
+            ctx.restore();
+        }
 
         // Draw Selection Box
         if (selectionBox.value) {
@@ -914,6 +1066,8 @@ function syncState() {
   objects.value = JSON.parse(json);
   const selIdsJson = engine.value.get_selected_ids();
   selectedIds.value = JSON.parse(selIdsJson);
+  const historyJson = engine.value.execute_command(JSON.stringify({ action: 'get_history', params: {} }));
+  history.value = JSON.parse(historyJson);
 }
 
 function executeCommand(cmd: any) {
@@ -1005,8 +1159,37 @@ function handleWheel(e: WheelEvent) {
 
   const worldPos = screenToWorld(x, y);
 
-  if (activeTool.value === 'brush') {
-      if (engine.value) engine.value.hide_selection = true;
+          if (activeTool.value === 'magic_wand') {
+              const idsStr = engine.value.select_point(x, y, false, true);
+              const ids = JSON.parse(idsStr);
+              if (ids.length > 0) {
+                  executeCommand({
+                      action: 'magic_wand',
+                      params: {
+                          id: ids[0],
+                          x: worldPos.x,
+                          y: worldPos.y,
+                          tolerance: magicWandTolerance.value
+                      }
+                  });
+              }
+              return;
+          }
+  
+          if (activeTool.value === 'clone_stamp') {
+              if (e.altKey) {
+                  cloneSource.value = { x: worldPos.x, y: worldPos.y };
+                  console.log("Clone source set:", cloneSource.value);
+                  return;
+              }
+              if (cloneSource.value && targetImageId.value !== -1) {
+                  isDragging.value = true;
+                  executeCommand({ action: 'update', params: { id: targetImageId.value, save_undo: true } });
+              }
+              return;
+          }
+  
+          if (activeTool.value === 'brush') {      if (engine.value) engine.value.hide_selection = true;
       const res = executeCommand({
           action: 'create_brush_stroke',
           params: {
@@ -1046,10 +1229,28 @@ function handleWheel(e: WheelEvent) {
   }
 
   if (activeTool.value === 'eraser') {
-      const idsStr = engine.value.select_point(x, y, false, true);
-      const ids = JSON.parse(idsStr);
-      if (ids.length > 0) {
-          executeCommand({ action: 'delete', params: { ids } });
+      if (targetImageId.value !== -1) {
+          // Save undo state before starting erase by sending a dummy update
+          executeCommand({ action: 'update', params: { id: targetImageId.value, save_undo: true } });
+          
+          const modified = engine.value.erase_image(targetImageId.value, worldPos.x, worldPos.y, eraserSize.value);
+          if (modified) {
+              const pixels = engine.value.get_image_rgba(targetImageId.value);
+              const width = engine.value.get_image_width(targetImageId.value);
+              const height = engine.value.get_image_height(targetImageId.value);
+              if (pixels && width && height) {
+                  const tempCanvas = document.createElement('canvas');
+                  tempCanvas.width = width;
+                  tempCanvas.height = height;
+                  const tCtx = tempCanvas.getContext('2d');
+                  if (tCtx) {
+                      const imageData = new ImageData(new Uint8ClampedArray(pixels), width, height);
+                      tCtx.putImageData(imageData, 0, 0);
+                      engine.value.set_image_object(targetImageId.value, tempCanvas);
+                      needsRender.value = true;
+                  }
+              }
+          }
       }
       return;
   }
@@ -1377,6 +1578,11 @@ function handlePointerMove(e: PointerEvent) {
   const x = e.clientX - rect.left;
   const y = e.clientY - rect.top;
 
+  if (activeTool.value === 'eraser') {
+      lastMousePos.value = { x, y };
+      needsRender.value = true;
+  }
+
   if (isPanning.value || activeTool.value === 'hand') {
       canvas.value.style.cursor = isPanning.value ? 'grabbing' : 'grab';
   }
@@ -1480,11 +1686,33 @@ function handlePointerMove(e: PointerEvent) {
       }
   }
 
+  if (activeTool.value === 'clone_stamp' && isDragging.value && cloneSource.value && targetImageId.value !== -1) {
+      const worldPos = screenToWorld(x, y);
+      const dx = worldPos.x - dragStart.value.x; // Wait, we need offset from start
+      // Actually, we need to track the current source point relative to where we started dragging
+      const currentSrcX = cloneSource.value.x + (worldPos.x - screenToWorld(dragStart.value.x, dragStart.value.y).x);
+      const currentSrcY = cloneSource.value.y + (worldPos.y - screenToWorld(dragStart.value.x, dragStart.value.y).y);
+
+      const modified = engine.value.clone_stamp(
+          targetImageId.value, 
+          currentSrcX, currentSrcY, 
+          worldPos.x, worldPos.y, 
+          cloneSize.value
+      );
+      
+      if (modified) {
+          updateImageFromEngine(targetImageId.value);
+      }
+      return;
+  }
+
   if (activeTool.value === 'eraser' && isDragging.value) {
-      const idsStr = engine.value.select_point(x, y, false, true);
-      const ids = JSON.parse(idsStr);
-      if (ids.length > 0) {
-          executeCommand({ action: 'delete', params: { ids } });
+      if (targetImageId.value !== -1) {
+          const worldPos = screenToWorld(x, y);
+          const modified = engine.value.erase_image(targetImageId.value, worldPos.x, worldPos.y, eraserSize.value);
+          if (modified) {
+              updateImageFromEngine(targetImageId.value);
+          }
       }
       return;
   }
@@ -2131,13 +2359,125 @@ function removeGradientStop(prop: 'fill' | 'stroke', idx: number) {
     updateSelected(prop + '_gradient', grad);
 }
 
-function updateSelected(key: string, value: any, saveUndo: boolean = true) {
-    if (selectedIds.value.length === 0) return;
-    executeCommand({
-        action: 'update',
-        params: { ids: selectedIds.value, [key]: value, save_undo: saveUndo }
-    });
+function addEffect(type: string) {
+
+  if (!selectedObject.value) return;
+
+  const effect = {
+
+    effect_type: type,
+
+    enabled: true,
+
+    color: '#000000',
+
+    opacity: 0.5,
+
+    blur: 10,
+
+    x: 5,
+
+    y: 5,
+
+    size: 0,
+
+    spread: 0,
+
+    blend_mode: 'normal'
+
+  };
+
+  const newStyle = {
+
+    effects: [...selectedObject.value.layer_style.effects, effect]
+
+  };
+
+  updateSelected('layer_style', newStyle);
+
 }
+
+
+
+function removeEffect(index: number) {
+
+  if (!selectedObject.value) return;
+
+  const newEffects = [...selectedObject.value.layer_style.effects];
+
+  newEffects.splice(index, 1);
+
+  updateSelected('layer_style', { effects: newEffects });
+
+}
+
+
+
+function updateLayerStyle() {
+
+  if (!selectedObject.value) return;
+
+  updateSelected('layer_style', selectedObject.value.layer_style);
+
+}
+
+
+
+function jumpToHistory(index: number) {
+
+  if (!engine.value) return;
+
+  // This is a simplified "jump" by just calling undo/redo until we reach the target.
+
+  // In a real app, you'd store full states or use a more efficient delta system.
+
+  const currentHistoryLen = history.value.length;
+
+  const targetLen = index + 1;
+
+  
+
+  if (targetLen < currentHistoryLen) {
+
+    for (let i = 0; i < currentHistoryLen - targetLen; i++) {
+
+      engine.value.undo();
+
+    }
+
+  }
+
+  syncState();
+
+  needsRender.value = true;
+
+}
+
+
+
+function updateSelected(key: string, value: any, saveUndo: boolean = true) {
+
+  if (selectedIds.value.length === 0) return;
+
+  executeCommand({
+
+    action: 'update',
+
+    params: {
+
+      ids: selectedIds.value,
+
+      [key]: value,
+
+      save_undo: saveUndo
+
+    }
+
+  });
+
+}
+
+
 
 function deleteSelected() {
     if (selectedIds.value.length === 0) return;
@@ -2182,19 +2522,7 @@ function handleOpenImage(event: Event) {
         updateArtboard();
 
         // Center viewport and zoom to fit
-        const padding = 50;
-        const container = canvasContainer.value;
-        if (container) {
-            const zoomX = (container.clientWidth - padding * 2) / img.width;
-            const zoomY = (container.clientHeight - padding * 2) / img.height;
-            const zoom = Math.min(zoomX, zoomY, 1.0);
-            
-            const vx = (container.clientWidth - img.width * zoom) / 2;
-            const vy = (container.clientHeight - img.height * zoom) / 2;
-            
-            viewport.value = { x: vx, y: vy, zoom };
-            engine.value.set_viewport(viewport.value.x, viewport.value.y, viewport.value.zoom);
-        }
+        zoomToFit();
 
         // Add image
         const res = executeCommand({
@@ -2259,19 +2587,72 @@ function exportArtboard() {
     }
 }
 
+function exportSvg() {
+    if (!engine.value) return;
+    const svgData = engine.value.export_svg();
+    const blob = new Blob([svgData], { type: 'image/svg+xml' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'export.svg';
+    link.click();
+    URL.revokeObjectURL(url);
+}
+
+function exportPsd() {
+    if (!engine.value) return;
+    const psdData = engine.value.export_psd();
+    if (psdData.length === 0) return;
+    const blob = new Blob([psdData], { type: 'image/vnd.adobe.photoshop' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'export.psd';
+    link.click();
+    URL.revokeObjectURL(url);
+}
+
+function exportAi() {
+    if (!engine.value) return;
+    const aiData = engine.value.export_ai();
+    if (aiData.length === 0) return;
+    const blob = new Blob([aiData], { type: 'application/postscript' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'export.ai';
+    link.click();
+    URL.revokeObjectURL(url);
+}
+
 function handleFileUpload(event: Event) {
   const file = (event.target as HTMLInputElement).files?.[0];
-  if (!file || !engine.value) return;
+  if (!file) {
+    console.log("No file selected");
+    return;
+  }
+  if (!engine.value) {
+    console.log("Engine not initialized");
+    return;
+  }
 
   const filename = file.name.toLowerCase();
+  console.log("Handling file upload:", filename, file.size, "bytes");
 
-  if (filename.endsWith('.psd') || filename.endsWith('.ai')) {
+  if (filename.endsWith('.psd') || filename.endsWith('.ai') || filename.endsWith('.svg')) {
       const reader = new FileReader();
       reader.onload = (e) => {
+          console.log("FileReader loaded", filename);
           if (engine.value && e.target?.result instanceof ArrayBuffer) {
               const data = new Uint8Array(e.target.result);
+              console.log("Data converted to Uint8Array, length:", data.length);
               try {
+                  // Clear current project BEFORE import
+                  executeCommand({ action: 'clear', params: {} });
+                  imageMap.clear();
+
                   const resultJson = engine.value.import_file(file.name, data);
+                  console.log("import_file returned:", resultJson.substring(0, 100) + "...");
                   const result = JSON.parse(resultJson);
                   
                   if (result.error) {
@@ -2279,25 +2660,49 @@ function handleFileUpload(event: Event) {
                       return;
                   }
 
-                  // Result is an array of objects.
-                  // For each object, if it has image_data_url, we need to load it.
-                  if (Array.isArray(result)) {
-                      result.forEach((obj: any) => {
-                          if (obj.image_data_url) {
-                              const img = new Image();
-                              img.onload = () => {
-                                  engine.value?.set_image_object(obj.id, img);
-                                  imageMap.set(obj.id, img);
-                                  needsRender.value = true;
-                              };
-                              img.src = obj.image_data_url;
-                          }
-                      });
+                  let importedObjects = [];
+                  if (result.objects && Array.isArray(result.objects)) {
+                      importedObjects = result.objects;
+                      
+                      // Resize artboard
+                      if (result.width && result.height) {
+                          artboard.value.width = result.width;
+                          artboard.value.height = result.height;
+                          updateArtboard();
+                          zoomToFit();
+                      }
+                  } else if (Array.isArray(result)) {
+                      // Fallback for old format if AI import still returns array
+                      importedObjects = result;
                   }
+
+                  syncState();
+                  console.log("Imported", importedObjects.length, "objects");
+                  importedObjects.forEach((obj: any) => {
+                      if (obj.image_data_url) {
+                          console.log("Loading image for object:", obj.id, obj.name);
+                          const img = new Image();
+                          img.onload = () => {
+                              console.log("Image loaded for object:", obj.id);
+                              engine.value?.set_image_object(obj.id, img);
+                              imageMap.set(obj.id, img);
+                              needsRender.value = true;
+                          };
+                          img.onerror = (err) => {
+                              console.error("Failed to load image data URL for object:", obj.id, err);
+                          };
+                          img.src = obj.image_data_url;
+                      }
+                  });
               } catch (err) {
                   console.error("Failed to import file:", err);
               }
+          } else {
+              console.error("FileReader result is not an ArrayBuffer or engine is null");
           }
+      };
+      reader.onerror = (err) => {
+          console.error("FileReader error:", err);
       };
       reader.readAsArrayBuffer(file);
   } else {
@@ -2362,8 +2767,13 @@ function handleFileUpload(event: Event) {
               <div class="divider"></div>
               <button @click="showDocProps = true">Document Properties...</button>
               <div class="divider"></div>
-              <button @click="exportArtboard">Export Artboard...</button>
-            </div>
+                            <button @click="exportArtboard">Export Artboard (PNG)...</button>
+                                        <button @click="exportSvg">Export SVG...</button>
+                                        <button @click="exportPsd">Export PSD...</button>
+                                        <button @click="exportAi">Export AI (Illustrator)...</button>
+                            
+                          </div>
+              
           </div>
           <div class="menu-item">Edit</div>
           <div class="menu-item">Object</div>
@@ -2383,6 +2793,11 @@ function handleFileUpload(event: Event) {
           <div class="menu-item" v-if="targetImageId !== -1">
             <button @click="removeSelectedBackground" class="ai-bg-btn">
                 ✨ Remove BG
+            </button>
+          </div>
+          <div class="menu-item">
+            <button @click="generativeFill" class="ai-bg-btn" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%)">
+                <Sparkles :size="14" style="margin-right: 4px" /> Generative Fill
             </button>
           </div>
         </div>
@@ -2435,6 +2850,14 @@ function handleFileUpload(event: Event) {
                 @mouseenter="showTooltip($event, 'Bezier Pen (P)')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
           <PenTool :size="18" />
         </button>
+        <button :class="{ active: activeTool === 'magic_wand' }" @click="activeTool = 'magic_wand'" 
+                @mouseenter="showTooltip($event, 'Magic Wand (W)')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
+          <Wand2 :size="18" />
+        </button>
+        <button :class="{ active: activeTool === 'clone_stamp' }" @click="activeTool = 'clone_stamp'" 
+                @mouseenter="showTooltip($event, 'Clone Stamp (S)')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
+          <Stamp :size="18" />
+        </button>
         <button :class="{ active: activeTool === 'pencil' }" @click="activeTool = 'pencil'" 
                 @mouseenter="showTooltip($event, 'Pencil (N)')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
           <Pencil :size="18" />
@@ -2442,10 +2865,6 @@ function handleFileUpload(event: Event) {
         <button :class="{ active: activeTool === 'brush' }" @click="activeTool = 'brush'" 
                 @mouseenter="showTooltip($event, 'Vector Brush (B)')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
           <Brush :size="18" />
-        </button>
-        <button :class="{ active: activeTool === 'eraser' }" @click="activeTool = 'eraser'" 
-                @mouseenter="showTooltip($event, 'Eraser (E)')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
-          <Eraser :size="18" />
         </button>
         <button :class="{ active: activeTool === 'text' }" @click="activeTool = 'text'" 
                 @mouseenter="showTooltip($event, 'Text Tool (T)')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
@@ -2458,6 +2877,10 @@ function handleFileUpload(event: Event) {
         <button :class="{ active: activeTool === 'vectorize' }" @click="activeTool = 'vectorize'" 
                 @mouseenter="showTooltip($event, 'Vectorize Image (Q)')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
           <Zap :size="18" />
+        </button>
+        <button :class="{ active: activeTool === 'adjustment' }" @click="activeTool = 'adjustment'" 
+                @mouseenter="showTooltip($event, 'Adjustment Layer')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
+          <Settings :size="18" />
         </button>
         <button :class="{ active: activeTool === 'crop' }" @click="activeTool = 'crop'" 
                 @mouseenter="showTooltip($event, 'Crop Artboard (C)')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
@@ -2482,6 +2905,32 @@ function handleFileUpload(event: Event) {
 
       <div class="workspace-area">
         <div class="top-context-bar">
+          <template v-if="targetImageId !== -1">
+            <button :class="{ active: activeTool === 'eraser' }" @click="activeTool = 'eraser'" 
+                    @mouseenter="showTooltip($event, 'Bitmap Eraser (E)')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
+              <Eraser :size="18" />
+            </button>
+            <div v-if="activeTool === 'eraser'" class="context-control">
+              <label>Radius</label>
+              <input type="range" v-model.number="eraserSize" min="2" max="100" />
+            </div>
+            <div v-if="activeTool === 'clone_stamp'" class="context-control">
+              <label>Radius</label>
+              <input type="range" v-model.number="cloneSize" min="2" max="100" />
+              <span v-if="cloneSource" style="color: #4facfe; font-size: 10px; margin-left: 10px">
+                Source set (Alt+Click to change)
+              </span>
+              <span v-else style="color: #ff5f56; font-size: 10px; margin-left: 10px">
+                Alt+Click to set source
+              </span>
+            </div>
+            <div v-if="activeTool === 'magic_wand'" class="context-control">
+              <label>Tolerance</label>
+              <input type="range" v-model.number="magicWandTolerance" min="1" max="255" />
+              <span>{{ magicWandTolerance }}</span>
+            </div>
+            <div class="context-divider" v-if="selectedIds.length > 0"></div>
+          </template>
           <template v-if="selectedIds.length > 0">
             <button :class="{ active: activeTool === 'rotate' }" @click="activeTool = 'rotate'" 
                     @mouseenter="showTooltip($event, 'Rotate Tool (R)')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
@@ -2491,11 +2940,35 @@ function handleFileUpload(event: Event) {
                     @mouseenter="showTooltip($event, 'Gradient Tool (G)')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
               <PaintBucket :size="18" />
             </button>
+            <div class="context-divider"></div>
+            <!-- Boolean Operations -->
+            <div v-if="selectedIds.length >= 2" class="boolean-ops">
+              <button @click="booleanOp('union')" v-tooltip="'Union (Pathfinder)'"><Square :size="16" style="background: #555; border-radius: 2px" /></button>
+              <button @click="booleanOp('subtract')" v-tooltip="'Subtract (Pathfinder)'"><Square :size="16" style="clip-path: polygon(0 0, 100% 0, 100% 100%, 50% 100%, 50% 50%, 0 50%)" /></button>
+              <button @click="booleanOp('intersect')" v-tooltip="'Intersect (Pathfinder)'"><Circle :size="16" style="opacity: 0.5" /></button>
+            </div>
+            <!-- Masking -->
+            <button v-if="selectedIds.length === 1" @click="toggleMask" :class="{ active: selectedObject?.is_mask }" v-tooltip="'Toggle as Mask'">
+              <Zap :size="16" /> <!-- Placeholder icon for Mask -->
+            </button>
           </template>
         </div>
 
         <!-- Canvas Area -->
         <main class="canvas-area" ref="canvasContainer">
+          <!-- Rulers -->
+          <div class="ruler-corner"></div>
+          <div class="ruler ruler-horizontal" @mousedown="startGuideDrag('horizontal')">
+            <div v-for="n in 100" :key="n" class="ruler-mark" :style="{ left: ((n-1)*100*viewport.zoom + viewport.x) + 'px' }">
+              {{ (n-1)*100 }}
+            </div>
+          </div>
+          <div class="ruler ruler-vertical" @mousedown="startGuideDrag('vertical')">
+            <div v-for="n in 100" :key="n" class="ruler-mark" :style="{ top: ((n-1)*100*viewport.zoom + viewport.y) + 'px' }">
+              {{ (n-1)*100 }}
+            </div>
+          </div>
+
           <canvas 
             ref="canvas" 
             @pointerdown="handlePointerDown"
@@ -2512,7 +2985,7 @@ function handleFileUpload(event: Event) {
                 <div class="ai-loader-content">
                     <div class="ai-loader-title" style="color: #ff5f56;">Engine Error</div>
                     <div style="font-size: 12px; color: #ccc; margin-bottom: 15px;">{{ engineLoadError }}</div>
-                    <button @click="window.location.reload()" class="ai-bg-btn-large" style="background: #444;">Reload App</button>
+                    <button @click="reloadApp()" class="ai-bg-btn-large" style="background: #444;">Reload App</button>
                 </div>
             </div>
         </div>
@@ -2615,7 +3088,8 @@ function handleFileUpload(event: Event) {
           </section>
 
           <template v-else>
-            <section v-if="selectedObject" class="panel properties-panel">
+            <template v-if="selectedObject">
+              <section class="panel properties-panel">
             <!-- ... existing selectedObject panel ... -->
             <h3>Properties {{ selectedIds.length > 1 ? `(${selectedIds.length})` : '' }}</h3>
             <div class="property-grid">
@@ -2642,7 +3116,7 @@ function handleFileUpload(event: Event) {
                   <select :value="selectedObject.brush_id" @change="e => {
                       const bid = Number((e.target as HTMLSelectElement).value);
                       updateSelected('brush_id', bid);
-                      if (bid > 0) selectedBrushId.value = bid;
+                      if (bid > 0) selectedBrushId = bid;
                   }">
                       <option :value="0">None (Standard Stroke)</option>
                       <option v-for="b in brushes" :key="b.id" :value="b.id">{{ b.name }}</option>
@@ -2873,7 +3347,7 @@ function handleFileUpload(event: Event) {
                   <label>Threshold</label>
                   <input type="range" min="0" max="255" step="1" v-model="vectorizeThreshold" />
                   <div class="actions">
-                      <button class="ai-bg-btn-large" @click="vectorizeImage" style="background: #4facfe; color: white;">✨ Trace to Path</button>
+                      <button class="ai-bg-btn-large" @click="() => vectorizeImage()" style="background: #4facfe; color: white;">✨ Trace to Path</button>
                   </div>
 
                   <div class="actions">
@@ -2917,7 +3391,62 @@ function handleFileUpload(event: Event) {
             </div>
           </section>
 
-          <section v-else-if="targetImageId !== -1" class="panel filters-panel">
+          <!-- Typography Panel -->
+          <section v-if="selectedObject.shape_type === 'Text'" class="panel typo-panel">
+            <h3>Typography</h3>
+            <div class="typo-controls">
+              <div class="control-group">
+                <label>Leading</label>
+                <input type="number" v-model="selectedObject.leading" step="0.1" @input="updateSelected('leading', selectedObject.leading)" />
+              </div>
+              <div class="control-group">
+                <label>Tracking</label>
+                <input type="number" v-model="selectedObject.tracking" @input="updateSelected('tracking', selectedObject.tracking)" />
+              </div>
+              <div class="control-group">
+                <label>Kerning</label>
+                <input type="number" v-model="selectedObject.kerning" @input="updateSelected('kerning', selectedObject.kerning)" />
+              </div>
+            </div>
+          </section>
+
+          <!-- Layer Style (FX) Panel -->
+          <section class="panel fx-panel">
+            <div class="panel-header">
+              <h3>Effects (FX)</h3>
+              <button @click="addEffect('DropShadow')" class="btn-icon-small"><Plus :size="14" /></button>
+            </div>
+            <div class="fx-list">
+              <div v-for="(effect, index) in selectedObject.layer_style.effects" :key="index" class="fx-item">
+                <div class="fx-row">
+                  <input type="checkbox" v-model="effect.enabled" @change="updateLayerStyle" />
+                  <span>{{ effect.effect_type }}</span>
+                  <button @click="removeEffect(index)" class="btn-icon-small"><Trash2 :size="14" /></button>
+                </div>
+                <div v-if="effect.enabled" class="fx-controls">
+                  <div class="control-group">
+                    <label>Blur</label>
+                    <input type="range" v-model="effect.blur" min="0" max="100" @input="updateLayerStyle" />
+                  </div>
+                  <div class="control-group">
+                    <label>Offset X</label>
+                    <input type="number" v-model="effect.x" @input="updateLayerStyle" />
+                  </div>
+                  <div class="control-group">
+                    <label>Offset Y</label>
+                    <input type="number" v-model="effect.y" @input="updateLayerStyle" />
+                  </div>
+                  <div class="control-group">
+                    <label>Color</label>
+                    <input type="color" v-model="effect.color" @input="updateLayerStyle" />
+                  </div>
+                </div>
+              </div>
+            </div>
+          </section>
+        </template>
+
+        <section v-else-if="targetImageId !== -1" class="panel filters-panel">
             <h3>Image Adjustments (BG)</h3>
             <div class="property-grid">
                 <label>Brightness</label>
@@ -2966,7 +3495,7 @@ function handleFileUpload(event: Event) {
                 <label>Threshold</label>
                 <input type="range" min="0" max="255" step="1" v-model="vectorizeThreshold" />
                 <div class="actions" style="grid-column: span 2;">
-                    <button class="ai-bg-btn-large" @click="vectorizeImage" style="background: #4facfe; color: white; width: 100%;">✨ Trace to Path</button>
+                    <button class="ai-bg-btn-large" @click="() => vectorizeImage()" style="background: #4facfe; color: white; width: 100%;">✨ Trace to Path</button>
                 </div>
             </div>
           </section>
@@ -2999,6 +3528,20 @@ function handleFileUpload(event: Event) {
             </div>
           </section>
           </template>
+
+          <!-- History Panel (Always Bottom of panels stack) -->
+          <section class="panel history-panel">
+            <h3>History</h3>
+            <div class="history-list">
+              <div v-for="(action, index) in history" :key="index" 
+                   class="history-item" 
+                   :class="{ active: index === history.length - 1 }"
+                   @click="jumpToHistory(index)">
+                <History :size="14" />
+                <span>{{ action }}</span>
+              </div>
+            </div>
+          </section>
         </div>
 
         <!-- AI Chat Panel (Always Bottom) -->
@@ -3200,14 +3743,144 @@ function handleFileUpload(event: Event) {
   margin: 6px 0;
 }
 
-.logo {
-  font-weight: 800;
+.panel {
+  padding: 12px;
+  border-bottom: 1px solid #333;
+}
+
+.panel h3 {
+  font-size: 11px;
+  text-transform: uppercase;
+  color: #999;
+  margin-bottom: 12px;
+  font-weight: 600;
   letter-spacing: 0.5px;
-  font-size: 16px;
-  color: #fff;
+}
+
+.panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.btn-icon-small {
+  background: transparent;
+  border: none;
+  color: #999;
+  cursor: pointer;
+  padding: 2px;
   display: flex;
   align-items: center;
+  border-radius: 4px;
+}
+
+.btn-icon-small:hover {
+  background: #444;
+  color: #fff;
+}
+
+/* History Panel */
+.history-list {
+  max-height: 200px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.history-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  font-size: 12px;
+  color: #bbb;
+  cursor: pointer;
+  border-radius: 4px;
+}
+
+.history-item:hover {
+  background: #333;
+}
+
+.history-item.active {
+  background: rgba(79, 172, 254, 0.2);
+  color: #4facfe;
+}
+
+/* FX Panel */
+.fx-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.fx-item {
+  background: #1e1e1e;
+  border-radius: 4px;
+  padding: 4px;
+}
+
+.fx-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  padding: 4px;
+}
+
+.fx-controls {
+  padding: 8px;
+  border-top: 1px solid #333;
+  display: flex;
+  flex-direction: column;
   gap: 6px;
+}
+
+.typo-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.control-group {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 11px;
+  color: #999;
+}
+
+.control-group input[type="range"] {
+  width: 60px;
+}
+
+.control-group input[type="number"] {
+  width: 40px;
+  background: #111;
+  border: 1px solid #444;
+  color: #eee;
+  font-size: 10px;
+}
+
+.boolean-ops {
+  display: flex;
+  gap: 4px;
+  margin: 0 8px;
+}
+
+.boolean-ops button {
+  background: #333;
+  border: 1px solid #444;
+  color: #eee;
+  padding: 4px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.boolean-ops button:hover {
+  background: #4facfe;
+  border-color: #4facfe;
 }
 
 .pro-tag {
@@ -3375,6 +4048,28 @@ function handleFileUpload(event: Event) {
     color: white;
 }
 
+.context-divider {
+    width: 1px;
+    height: 20px;
+    background: #333;
+    margin: 0 10px;
+}
+
+.context-control {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 11px;
+    color: #999;
+    padding-left: 4px;
+}
+
+.context-control input[type="range"] {
+    width: 80px;
+    height: 4px;
+    accent-color: #4facfe;
+}
+
 /* Toolbar */
 .toolbar-side {
   width: 45px;
@@ -3452,6 +4147,67 @@ function handleFileUpload(event: Event) {
   background-image: radial-gradient(#222 1px, transparent 1px);
   background-size: 20px 20px;
 }
+
+.canvas-area canvas {
+  position: absolute;
+  top: 30px;
+  left: 30px;
+  width: calc(100% - 30px);
+  height: calc(100% - 30px);
+}
+
+.ruler-corner {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 30px;
+  height: 30px;
+  background: #252525;
+  z-index: 11;
+  border-right: 1px solid #333;
+  border-bottom: 1px solid #333;
+}
+
+.ruler {
+  position: absolute;
+  background: #252525;
+  z-index: 10;
+  font-size: 9px;
+  color: #666;
+  user-select: none;
+}
+
+.ruler-horizontal {
+  top: 0;
+  left: 30px;
+  right: 0;
+  height: 30px;
+  border-bottom: 1px solid #333;
+}
+
+.ruler-vertical {
+  top: 30px;
+  left: 0;
+  bottom: 0;
+  width: 30px;
+  border-right: 1px solid #333;
+}
+
+.ruler-mark {
+  position: absolute;
+  padding: 2px;
+}
+
+.ruler-horizontal .ruler-mark {
+  border-left: 1px solid #444;
+  height: 100%;
+}
+
+.ruler-vertical .ruler-mark {
+  border-top: 1px solid #444;
+  width: 100%;
+}
+
 
 canvas {
   display: block;
