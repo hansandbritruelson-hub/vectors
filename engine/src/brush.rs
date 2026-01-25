@@ -151,7 +151,7 @@ impl BrushEngine {
                 
                 ctx.begin_path();
                 let _ = ctx.arc(0.0, 0.0, size / 2.0, 0.0, std::f64::consts::PI * 2.0);
-                ctx.set_fill_style(&JsValue::from_str(color));
+                ctx.set_fill_style_str(color);
                 ctx.fill();
             }
             BrushTip::Image { image_id } => {
