@@ -15,6 +15,8 @@ pub enum ShapeType {
     Group,
     Adjustment,
     Guide,
+    Intelligent,
+    SmartBackground,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]

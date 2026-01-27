@@ -4,10 +4,7 @@ use crate::types::HandleType;
 
 #[wasm_bindgen]
 impl VectorEngine {
-    pub fn select_point(&mut self, x: f64, y: f64, shift: bool, ignore_locked: bool) -> String {
-        let tx = (x - self.viewport_x) / self.viewport_zoom;
-        let ty = (y - self.viewport_y) / self.viewport_zoom;
-
+    pub fn select_point(&mut self, tx: f64, ty: f64, shift: bool, ignore_locked: bool) -> String {
         let mut hit_id = None;
         for obj in self.objects.iter().rev() {
             if obj.locked && !ignore_locked { continue; }
@@ -46,17 +43,14 @@ impl VectorEngine {
         self.get_selected_ids()
     }
 
-    pub fn select_rect(&mut self, x: f64, y: f64, width: f64, height: f64, shift: bool, ignore_locked: bool) -> String {
-        let mut sx = x;
-        let mut sy = y;
-        let mut sw = width;
-        let mut sh = height;
-        if sw < 0.0 { sx += sw; sw = -sw; }
-        if sh < 0.0 { sy += sh; sh = -sh; }
-        let x1 = (sx - self.viewport_x) / self.viewport_zoom;
-        let y1 = (sy - self.viewport_y) / self.viewport_zoom;
-        let x2 = (sx + sw - self.viewport_x) / self.viewport_zoom;
-        let y2 = (sy + sh - self.viewport_y) / self.viewport_zoom;
+    pub fn select_rect(&mut self, x1: f64, y1: f64, x2: f64, y2: f64, shift: bool, ignore_locked: bool) -> String {
+        let mut sx = x1;
+        let mut sy = y1;
+        let mut ex = x2;
+        let mut ey = y2;
+        if sx > ex { std::mem::swap(&mut sx, &mut ex); }
+        if sy > ey { std::mem::swap(&mut sy, &mut ey); }
+
         if !shift {
             self.selected_ids.clear();
         }
@@ -64,7 +58,7 @@ impl VectorEngine {
             if obj.locked && !ignore_locked { continue; }
             let obj_x2 = obj.x + obj.width;
             let obj_y2 = obj.y + obj.height;
-            if obj.x < x2 && obj_x2 > x1 && obj.y < y2 && obj_y2 > y1 {
+            if obj.x < ex && obj_x2 > sx && obj.y < ey && obj_y2 > sy {
                  if !self.selected_ids.contains(&obj.id) {
                      self.selected_ids.push(obj.id);
                  }
@@ -73,9 +67,7 @@ impl VectorEngine {
         self.get_selected_ids()
     }
 
-    pub fn hit_test_handles(&self, x: f64, y: f64) -> String {
-        let tx = (x - self.viewport_x) / self.viewport_zoom;
-        let ty = (y - self.viewport_y) / self.viewport_zoom;
+    pub fn hit_test_handles(&self, tx: f64, ty: f64) -> String {
         if let Some(&id) = self.selected_ids.last() {
             if let Some(obj) = self.objects.iter().find(|o| o.id == id) {
                 let cx = obj.x + obj.width / 2.0;

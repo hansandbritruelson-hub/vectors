@@ -3,25 +3,21 @@ import { ref, onMounted, onUnmounted, computed, watch, nextTick } from 'vue';
 import { VectorEngine } from './pkg/engine';
 import { aiService, type ModelStatus } from './ai';
 import LayerItem from './components/LayerItem.vue';
-import BrushStudio from './components/BrushStudio.vue';
-import SmartParams from './components/SmartParams.vue';
 import { 
     MousePointer2, Square, Circle, PenTool, Crop, 
     Star, Hexagon, Pipette, Type, Upload,
     Trash2, Copy, BringToFront, SendToBack, ChevronUp, ChevronDown,
     Pencil, Eraser, Hand, Search, RotateCw, PaintBucket, Brush,
-    Zap, Plus, History, Settings, Wand2, Stamp, Sparkles, Palette, Grid
+    Zap, Plus, History, Settings, Wand2, Stamp, Sparkles
 } from 'lucide-vue-next';
 
-type Tool = 'select' | 'image' | 'bezier' | 'crop' | 'eyedropper' | 'text' | 'pencil' | 'brush' | 'eraser' | 'hand' | 'zoom' | 'rotate' | 'gradient' | 'vectorize' | 'adjustment' | 'magic_wand' | 'clone_stamp' | 'warp' | string;
+type Tool = 'select' | 'rect' | 'circle' | 'image' | 'bezier' | 'crop' | 'star' | 'poly' | 'eyedropper' | 'text' | 'pencil' | 'brush' | 'eraser' | 'hand' | 'zoom' | 'rotate' | 'gradient' | 'vectorize' | 'adjustment' | 'magic_wand' | 'clone_stamp';
 
 const canvas = ref<HTMLCanvasElement | null>(null);
 const canvasContainer = ref<HTMLElement | null>(null);
 const chatHistory = ref<HTMLElement | null>(null);
 const engine = ref<VectorEngine | null>(null);
 const engineLoadError = ref<string | null>(null);
-const intelligentShapesMetadata = ref<any[]>([]);
-const smartBackgroundsMetadata = ref<any[]>([]);
 
 // Brush State
 const brushes = ref<any[]>([]);
@@ -90,10 +86,7 @@ function hideTooltip() {
 // State
 const activeTool = ref<Tool>('select');
 const showShapesMenu = ref(false);
-const showBackgroundsMenu = ref(false);
 const snapMode = ref(true);
-const showRulers = ref(true);
-const rulerSize = ref(20);
 const objects = ref<any[]>([]);
 const history = ref<string[]>([]);
 const imageMap = new Map<number, HTMLImageElement>();
@@ -108,71 +101,6 @@ const needsRender = ref(true);
 const selectionBox = ref<{ x: number, y: number, w: number, h: number } | null>(null);
 const activeHandle = ref<{ id: number, type: string } | null>(null);
 
-const showBrushStudio = ref(false);
-
-function createBrush() {
-    if (!engine.value) return;
-    const newBrush = {
-        id: 0,
-        name: 'New Brush',
-        tip: { Calligraphic: { angle: 0, roundness: 1.0 } },
-        size: 20,
-        spacing: 0.1,
-        pressure_enabled: true,
-        min_size_fraction: 0.2,
-        smoothing: 0.5,
-        scatter: 0.0,
-        rotation_jitter: 0.0
-    };
-    const id = engine.value.register_brush(JSON.stringify(newBrush));
-    if (id > 0) {
-        // Refresh brushes
-        const brushesJson = engine.value.execute_command(JSON.stringify({ action: 'get_brushes', params: {} }));
-        brushes.value = JSON.parse(brushesJson);
-        selectedBrushId.value = id;
-    }
-}
-
-const warpState = ref({
-    isWarping: false,
-    mesh: null as any,
-    originalObjects: [] as any[],
-    dragIndex: -1
-});
-
-function startWarp() {
-    if (selectedIds.value.length === 0) return;
-    const res = engine.value?.execute_command(JSON.stringify({
-        action: 'get_warp_mesh',
-        params: { ids: selectedIds.value, rows: 4, cols: 4 }
-    }));
-    if (res) {
-        const mesh = JSON.parse(res);
-        warpState.value = {
-            isWarping: true,
-            mesh,
-            originalObjects: JSON.parse(engine.value?.get_objects_json() || '[]'),
-            dragIndex: -1
-        };
-        activeTool.value = 'warp';
-    }
-}
-
-function applyWarp() {
-    if (warpState.value.mesh) {
-        executeCommand({
-            action: 'apply_warp_mesh',
-            params: { mesh: warpState.value.mesh, save_undo: true }
-        });
-    }
-    cancelWarp();
-}
-
-function cancelWarp() {
-    warpState.value = { isWarping: false, mesh: null, originalObjects: [], dragIndex: -1 };
-    activeTool.value = 'select';
-    needsRender.value = true;
-}
 
 function booleanOp(operation: string) {
   executeCommand({
@@ -182,70 +110,6 @@ function booleanOp(operation: string) {
       ids: selectedIds.value
     }
   });
-}
-
-function addIntelligentShape(shapeId: string) {
-    const meta = intelligentShapesMetadata.value.find(m => m.id === shapeId);
-    if (!meta || !engine.value) return;
-
-    const params = meta.parameters.map((p: any) => p.default);
-    
-    // Add in center of viewport or top-left
-    const worldPos = screenToWorld(400, 300);
-
-    const res = executeCommand({
-        action: 'add',
-        params: {
-            type: 'Intelligent',
-            intelligent_type: shapeId,
-            intelligent_params: params,
-            x: worldPos.x - 100,
-            y: worldPos.y - 100,
-            width: 200,
-            height: 200,
-            fill: '#e0e0e0',
-            stroke: '#333333',
-            stroke_width: 2,
-            save_undo: true
-        }
-    });
-
-    if (res && res.id) {
-        executeCommand({ action: 'select', params: { id: res.id } });
-    }
-    activeTool.value = shapeId;
-    showShapesMenu.value = false;
-}
-
-function addSmartBackground(bgId: string) {
-    const meta = smartBackgroundsMetadata.value.find(m => m.id === bgId);
-    if (!meta || !engine.value) return;
-
-    const params = meta.parameters.map((p: any) => p.default);
-    
-    const res = executeCommand({
-        action: 'add',
-        params: {
-            type: 'SmartBackground',
-            intelligent_type: bgId,
-            intelligent_params: params,
-            x: 0,
-            y: 0,
-            width: artboard.value.width,
-            height: artboard.value.height,
-            fill: '#ffffff',
-            save_undo: true
-        }
-    });
-
-    if (res && res.id) {
-        executeCommand({ action: 'select', params: { id: res.id } });
-        // Send to back so it's a background
-        executeCommand({ action: 'send_to_back', params: { id: res.id } });
-        // Lock it so it doesn't get moved accidentally
-        executeCommand({ action: 'update', params: { id: res.id, locked: true } });
-    }
-    showBackgroundsMenu.value = false;
 }
 
 function toggleMask() {
@@ -341,9 +205,12 @@ function updateImageFromEngine(id: number) {
 }
 
 function startGuideDrag(orientation: 'horizontal' | 'vertical') {
-    const handleMove = () => {
+    const handleMove = (e: MouseEvent) => {
         const rect = canvas.value?.getBoundingClientRect();
         if (!rect) return;
+        const x = e.clientX - rect.left;
+        const y = e.clientY - rect.top;
+        const worldPos = screenToWorld(x, y);
         
         // Render a temporary guide or just wait for up
     };
@@ -433,9 +300,15 @@ const showDocProps = ref(false);
 
 function screenToWorld(x: number, y: number) {
     if (!canvas.value) return { x, y };
+    // Get the actual screen position of the canvas element
+    // Since the canvas is nested and offset by rulers, we need its client rect
+    const rect = canvas.value.getBoundingClientRect();
+    const cx = x - rect.left;
+    const cy = y - rect.top;
+    
     return {
-        x: (x - viewport.value.x) / viewport.value.zoom,
-        y: (y - viewport.value.y) / viewport.value.zoom
+        x: (cx - viewport.value.x) / viewport.value.zoom,
+        y: (cy - viewport.value.y) / viewport.value.zoom
     };
 }
 
@@ -829,29 +702,16 @@ watch(clipToArtboard, (val) => {
     executeCommand({ action: 'set_clipping', params: { enabled: val } });
 });
 
-onMounted(async () => {
+onMounted(() => {
   if (canvas.value && canvasContainer.value) {
-    const dpr = window.devicePixelRatio || 1;
-    const w = canvasContainer.value.clientWidth - rulerSize.value;
-    const h = canvasContainer.value.clientHeight - rulerSize.value;
-    canvas.value.width = w * dpr;
-    canvas.value.height = h * dpr;
+    canvas.value.width = canvasContainer.value.clientWidth;
+    canvas.value.height = canvasContainer.value.clientHeight;
     
     try {
         if (typeof VectorEngine === 'undefined') {
             throw new Error("VectorEngine class is not defined. WASM module may have failed to load.");
         }
         engine.value = new VectorEngine();
-        
-        // Fetch intelligent shapes metadata
-        try {
-            const { get_intelligent_shapes_metadata, get_smart_backgrounds_metadata } = await import('./pkg/engine');
-            intelligentShapesMetadata.value = get_intelligent_shapes_metadata();
-            smartBackgroundsMetadata.value = get_smart_backgrounds_metadata();
-        } catch (e) {
-            console.error("Failed to fetch intelligent shapes/backgrounds metadata", e);
-        }
-
         updateArtboard();
         
         window.addEventListener('resize', handleResize);
@@ -974,24 +834,6 @@ function updateArtboard() {
             background: artboard.value.background
         }
     });
-
-    // Resize smart backgrounds to match new artboard
-    objects.value.forEach(obj => {
-        if (obj.shape_type === 'SmartBackground') {
-            executeCommand({
-                action: 'update',
-                params: {
-                    id: obj.id,
-                    width: Number(artboard.value.width),
-                    height: Number(artboard.value.height),
-                    x: 0,
-                    y: 0,
-                    save_undo: false
-                }
-            });
-        }
-    });
-
     showDocProps.value = false;
 }
 
@@ -1027,11 +869,8 @@ function newDocument() {
 
 function handleResize() {
   if (canvas.value && canvasContainer.value) {
-    const dpr = window.devicePixelRatio || 1;
-    const w = canvasContainer.value.clientWidth - rulerSize.value;
-    const h = canvasContainer.value.clientHeight - rulerSize.value;
-    canvas.value.width = w * dpr;
-    canvas.value.height = h * dpr;
+    canvas.value.width = canvasContainer.value.clientWidth;
+    canvas.value.height = canvasContainer.value.clientHeight;
     needsRender.value = true;
   }
 }
@@ -1046,14 +885,7 @@ function renderLoop() {
   if (needsRender.value) {
       const ctx = canvas.value.getContext('2d', { willReadFrequently: true });
       if (ctx) {
-        const dpr = window.devicePixelRatio || 1;
-        ctx.save();
-        ctx.scale(dpr, dpr);
         engine.value.render(ctx);
-        ctx.restore();
-
-        ctx.save();
-        ctx.scale(dpr, dpr);
 
         // Draw Eraser Cursor
         if (activeTool.value === 'eraser' && lastMousePos.value && targetImageId.value !== -1) {
@@ -1222,53 +1054,6 @@ function renderLoop() {
             ctx.restore();
         }
 
-        // Draw Warp Mesh
-        if (activeTool.value === 'warp' && warpState.value.mesh) {
-            ctx.save();
-            ctx.translate(viewport.value.x, viewport.value.y);
-            ctx.scale(viewport.value.zoom, viewport.value.zoom);
-
-            const mesh = warpState.value.mesh;
-            const rows = mesh.rows;
-            const cols = mesh.cols;
-            const pts = mesh.control_points;
-
-            ctx.strokeStyle = '#4facfe';
-            ctx.lineWidth = 1 / viewport.value.zoom;
-
-            // Draw lines
-            for (let r = 0; r <= rows; r++) {
-                ctx.beginPath();
-                for (let c = 0; c <= cols; c++) {
-                    const p = pts[r * (cols + 1) + c];
-                    if (c === 0) ctx.moveTo(p.x, p.y);
-                    else ctx.lineTo(p.x, p.y);
-                }
-                ctx.stroke();
-            }
-            for (let c = 0; c <= cols; c++) {
-                ctx.beginPath();
-                for (let r = 0; r <= rows; r++) {
-                    const p = pts[r * (cols + 1) + c];
-                    if (r === 0) ctx.moveTo(p.x, p.y);
-                    else ctx.lineTo(p.x, p.y);
-                }
-                ctx.stroke();
-            }
-
-            // Draw control points
-            pts.forEach((p: any, i: number) => {
-                ctx.beginPath();
-                ctx.arc(p.x, p.y, 4 / viewport.value.zoom, 0, Math.PI * 2);
-                ctx.fillStyle = warpState.value.dragIndex === i ? '#ff4f4f' : 'white';
-                ctx.fill();
-                ctx.stroke();
-            });
-
-            ctx.restore();
-        }
-
-        ctx.restore();
       }
       needsRender.value = false;
   }
@@ -1354,6 +1139,7 @@ function handleWheel(e: WheelEvent) {
   
   // Pointer Interactions
   function handlePointerDown(e: PointerEvent) {
+  console.log("handlePointerDown", activeTool.value);
   if (!canvas.value || !engine.value) return;
   const rect = canvas.value.getBoundingClientRect();
   const x = e.clientX - rect.left;
@@ -1373,34 +1159,8 @@ function handleWheel(e: WheelEvent) {
 
   const worldPos = screenToWorld(x, y);
 
-          if (activeTool.value === 'warp') {
-              if (warpState.value.mesh) {
-                  const hitDist = 12 / viewport.value.zoom;
-                  const mesh = warpState.value.mesh;
-                  for (let i = 0; i < mesh.control_points.length; i++) {
-                      const p = mesh.control_points[i];
-                      if (Math.hypot(worldPos.x - p.x, worldPos.y - p.y) < hitDist) {
-                          warpState.value.dragIndex = i;
-                          isDragging.value = true;
-                          return;
-                      }
-                  }
-              }
-
-              // If we didn't hit a mesh point, try to select an object to warp
-              const idsStr = engine.value.select_point(worldPos.x, worldPos.y, false, false);
-              const ids = JSON.parse(idsStr);
-              if (ids.length > 0) {
-                  selectedIds.value = ids;
-                  syncState();
-                  startWarp();
-                  return;
-              }
-              return;
-          }
-
           if (activeTool.value === 'magic_wand') {
-              const idsStr = engine.value.select_point(worldPos.x, worldPos.y, false, true);
+              const idsStr = engine.value.select_point(x, y, false, true);
               const ids = JSON.parse(idsStr);
               if (ids.length > 0) {
                   executeCommand({
@@ -1501,7 +1261,7 @@ function handleWheel(e: WheelEvent) {
       
       // 1. If nothing is selected, try to select something
       if (!obj) {
-          const resIds = JSON.parse(engine.value.select_point(worldPos.x, worldPos.y, false, false));
+          const resIds = JSON.parse(engine.value.select_point(x, y, false, false));
           selectedIds.value = resIds;
           syncState();
           obj = selectedObject.value;
@@ -1621,7 +1381,7 @@ function handleWheel(e: WheelEvent) {
 
       if (!bezierState.value.isDrawing && !bezierState.value.isEditing) {
           // Check if we hit an EXISTING path object to start editing
-          const idsStr = engine.value.select_point(worldPos.x, worldPos.y, false, false);
+          const idsStr = engine.value.select_point(x, y, false, false);
           const ids = JSON.parse(idsStr);
           if (ids.length > 0) {
                const obj = objects.value.find(o => o.id === ids[0]);
@@ -1710,7 +1470,7 @@ function handleWheel(e: WheelEvent) {
     }
 
     // Check handles first
-    const handleHitStr = engine.value?.hit_test_handles(worldPos.x, worldPos.y);
+    const handleHitStr = engine.value?.hit_test_handles(x, y);
     const handleHit = handleHitStr ? JSON.parse(handleHitStr) : null;
     
     if (handleHit) {
@@ -1727,7 +1487,7 @@ function handleWheel(e: WheelEvent) {
     }
 
     // 1. Perform selection
-    const idsStr = engine.value.select_point(worldPos.x, worldPos.y, e.shiftKey || e.metaKey, false);
+    const idsStr = engine.value.select_point(x, y, e.shiftKey || e.metaKey, false);
     selectedIds.value = JSON.parse(idsStr);
 
     // 2. Check if we are dragging a selected object
@@ -1761,23 +1521,13 @@ function handleWheel(e: WheelEvent) {
         currentX: worldPos.x,
         currentY: worldPos.y,
     };
-  } else if (intelligentShapesMetadata.value.some(m => m.id === activeTool.value)) {
-    const intelligentType = activeTool.value;
-    const meta = intelligentShapesMetadata.value.find(m => m.id === intelligentType);
-    const params = meta ? meta.parameters.map((p: any) => p.default) : [];
-
+  } else if (['rect', 'circle', 'star', 'poly'].includes(activeTool.value)) {
+    const type = activeTool.value === 'rect' ? 'Rectangle' : 
+                 activeTool.value === 'circle' ? 'Circle' :
+                 activeTool.value === 'star' ? 'Star' : 'Polygon';
     const res = executeCommand({
         action: 'add',
-        params: { 
-            type: 'Intelligent', 
-            intelligent_type: intelligentType,
-            intelligent_params: params,
-            x: worldPos.x, 
-            y: worldPos.y, 
-            width: 1, 
-            height: 1, 
-            fill: '#4facfe' 
-        }
+        params: { type, x: worldPos.x, y: worldPos.y, width: 1, height: 1, fill: '#4facfe' }
     });
     if (res && res.id) {
         executeCommand({ action: 'select', params: { id: res.id } });
@@ -1807,7 +1557,7 @@ function handleWheel(e: WheelEvent) {
       }
   } else if (activeTool.value === 'vectorize') {
       console.log("Vectorize tool: click at", x, y);
-      const idsStr = engine.value.select_point(worldPos.x, worldPos.y, false, true);
+      const idsStr = engine.value.select_point(x, y, false, true);
       const ids = JSON.parse(idsStr);
       console.log("Vectorize tool: hit ids", ids);
       if (ids.length > 0) {
@@ -1878,19 +1628,6 @@ function handlePointerMove(e: PointerEvent) {
       canvas.value.style.cursor = 'default';
   }
 
-  if (activeTool.value === 'warp' && isDragging.value && warpState.value.dragIndex !== -1) {
-      const worldPos = screenToWorld(x, y);
-      warpState.value.mesh.control_points[warpState.value.dragIndex] = { x: worldPos.x, y: worldPos.y };
-      
-      // Preview warp
-      if (engine.value) {
-          engine.value.set_objects(JSON.stringify(warpState.value.originalObjects));
-          engine.value.apply_warp_mesh(JSON.stringify(warpState.value.mesh), false);
-          needsRender.value = true;
-      }
-      return;
-  }
-
   if (activeTool.value === 'brush') {
       if (brushState.value.isDrawing) {
           const lastPt = brushState.value.points[brushState.value.points.length - 1];
@@ -1951,7 +1688,7 @@ function handlePointerMove(e: PointerEvent) {
 
   if (activeTool.value === 'clone_stamp' && isDragging.value && cloneSource.value && targetImageId.value !== -1) {
       const worldPos = screenToWorld(x, y);
-      // const dx = worldPos.x - dragStart.value.x; // Wait, we need offset from start
+      const dx = worldPos.x - dragStart.value.x; // Wait, we need offset from start
       // Actually, we need to track the current source point relative to where we started dragging
       const currentSrcX = cloneSource.value.x + (worldPos.x - screenToWorld(dragStart.value.x, dragStart.value.y).x);
       const currentSrcY = cloneSource.value.y + (worldPos.y - screenToWorld(dragStart.value.x, dragStart.value.y).y);
@@ -2279,13 +2016,13 @@ function handlePointerMove(e: PointerEvent) {
             bezierState.value.points = parsePathData(obj.path_data, obj.x, obj.y);
         }
     }
-  } else if (intelligentShapesMetadata.value.some(m => m.id === activeTool.value) && isDragging.value && selectedObject.value) {
+  } else if (['rect', 'circle', 'star', 'poly'].includes(activeTool.value) && selectedObject.value) {
     const startWorld = screenToWorld(dragStart.value.x, dragStart.value.y);
     const width = Math.max(1, worldPos.x - startWorld.x);
     const height = Math.max(1, worldPos.y - startWorld.y);
     executeCommand({
         action: 'update',
-        params: { id: selectedObject.value.id, width, height, save_undo: false }
+        params: { id: selectedObject.value.id, width, height }
     });
   }
 
@@ -2293,11 +2030,6 @@ function handlePointerMove(e: PointerEvent) {
 }
 
 function handlePointerUp(e: PointerEvent) {
-  if (activeTool.value === 'warp') {
-      isDragging.value = false;
-      warpState.value.dragIndex = -1;
-      return;
-  }
   if (isPanning.value) {
       isPanning.value = false;
       if (canvas.value) canvas.value.style.cursor = isSpacePressed.value ? 'grab' : 'default';
@@ -2307,9 +2039,7 @@ function handlePointerUp(e: PointerEvent) {
       try {
           const { x, y, w, h } = selectionBox.value;
           if (Math.abs(w) > 2 && Math.abs(h) > 2) {
-              const p1 = screenToWorld(x, y);
-              const p2 = screenToWorld(x + w, y + h);
-              const idsStr = engine.value?.select_rect(p1.x, p1.y, p2.x, p2.y, e.shiftKey || e.metaKey, false);
+              const idsStr = engine.value?.select_rect(x, y, w, h, e.shiftKey || e.metaKey, false);
               if (idsStr) selectedIds.value = JSON.parse(idsStr);
           }
       } finally {
@@ -2440,11 +2170,6 @@ function handlePointerUp(e: PointerEvent) {
       executeCommand({
           action: 'update',
           params: { id: selectedIds.value[0], save_undo: true }
-      });
-  } else if (intelligentShapesMetadata.value.some(m => m.id === activeTool.value) && isDragging.value && selectedObject.value) {
-      executeCommand({
-          action: 'update',
-          params: { id: selectedObject.value.id, save_undo: true }
       });
   }
 
@@ -2732,77 +2457,25 @@ function jumpToHistory(index: number) {
 
 function updateSelected(key: string, value: any, saveUndo: boolean = true) {
 
-
-
   if (selectedIds.value.length === 0) return;
-
-
 
   executeCommand({
 
-
-
     action: 'update',
-
-
 
     params: {
 
-
-
       ids: selectedIds.value,
-
-
 
       [key]: value,
 
-
-
       save_undo: saveUndo
-
-
 
     }
 
-
-
   });
 
-
-
 }
-
-
-
-
-
-
-
-function updateIntelligentParam(idx: number, val: number, saveUndo: boolean = true) {
-
-
-
-    if (!selectedObject.value || !selectedObject.value.intelligent_params) return;
-
-
-
-    const newParams = [...selectedObject.value.intelligent_params];
-
-
-
-    newParams[idx] = val;
-
-
-
-    updateSelected('intelligent_params', newParams, saveUndo);
-
-
-
-}
-
-
-
-
 
 
 
@@ -3113,12 +2786,6 @@ function handleFileUpload(event: Event) {
           </div>
           <div class="menu-item toggle-item">
             <label class="toggle-label">
-                <input type="checkbox" v-model="showRulers" />
-                Rulers
-            </label>
-          </div>
-          <div class="menu-item toggle-item">
-            <label class="toggle-label">
                 <input type="checkbox" v-model="clipToArtboard" />
                 Clip
             </label>
@@ -3155,50 +2822,27 @@ function handleFileUpload(event: Event) {
         </button>
 
         <div class="tool-group" @mouseenter="showShapesMenu = true" @mouseleave="showShapesMenu = false">
-            <button :class="{ active: intelligentShapesMetadata.some(m => m.id === activeTool) }" 
-                    @click="showShapesMenu = !showShapesMenu"
+            <button :class="{ active: ['rect', 'circle', 'star', 'poly'].includes(activeTool) }"
                     @mouseenter="showTooltip($event, 'Shapes')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
-                <Square :size="18" />
+                <component :is="activeTool === 'circle' ? Circle : activeTool === 'star' ? Star : activeTool === 'poly' ? Hexagon : Square" :size="18" />
             </button>
             <div v-if="showShapesMenu" class="tool-flyout">
-                <template v-if="intelligentShapesMetadata.length > 0">
-                    <div class="flyout-header">SHAPES</div>
-                    <div class="intelligent-shapes-grid">
-                        <button v-for="shape in intelligentShapesMetadata" :key="shape.id" 
-                                @click="activeTool = shape.id; showShapesMenu = false"
-                                :class="{ active: activeTool === shape.id }"
-                                class="intelligent-shape-btn"
-                                @mouseenter="showTooltip($event, shape.name)" @mousemove="moveTooltip" @mouseleave="hideTooltip">
-                            <svg viewBox="0 0 24 24" class="shape-icon-mini">
-                                <path :d="shape.icon" fill="currentColor" />
-                            </svg>
-                        </button>
-                    </div>
-                </template>
-            </div>
-        </div>
-
-        <div class="tool-group" @mouseenter="showBackgroundsMenu = true" @mouseleave="showBackgroundsMenu = false">
-            <button :class="{ active: showBackgroundsMenu }" 
-                    @click="showBackgroundsMenu = !showBackgroundsMenu"
-                    @mouseenter="showTooltip($event, 'Smart Backgrounds')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
-                <Palette :size="18" />
-            </button>
-            <div v-if="showBackgroundsMenu" class="tool-flyout">
-                <template v-if="smartBackgroundsMetadata.length > 0">
-                    <div class="flyout-header">BACKGROUNDS</div>
-                    <div class="intelligent-shapes-grid">
-                        <button v-for="bg in smartBackgroundsMetadata" :key="bg.id" 
-                                @click="addSmartBackground(bg.id)"
-                                class="intelligent-shape-btn"
-                                @mouseenter="showTooltip($event, bg.name)" @mousemove="moveTooltip" @mouseleave="hideTooltip">
-                            <svg viewBox="0 0 24 24" class="shape-icon-mini">
-                                <path :d="bg.icon" fill="currentColor" stroke="currentColor" stroke-width="1.5" v-if="bg.id === 'grass'" />
-                                <path :d="bg.icon" fill="currentColor" v-else />
-                            </svg>
-                        </button>
-                    </div>
-                </template>
+                <button :class="{ active: activeTool === 'rect' }" @click="activeTool = 'rect'" 
+                        @mouseenter="showTooltip($event, 'Rectangle (M)')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
+                    <Square :size="18" />
+                </button>
+                <button :class="{ active: activeTool === 'circle' }" @click="activeTool = 'circle'" 
+                        @mouseenter="showTooltip($event, 'Circle (O)')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
+                    <Circle :size="18" />
+                </button>
+                <button :class="{ active: activeTool === 'star' }" @click="activeTool = 'star'" 
+                        @mouseenter="showTooltip($event, 'Star (S)')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
+                    <Star :size="18" />
+                </button>
+                <button :class="{ active: activeTool === 'poly' }" @click="activeTool = 'poly'" 
+                        @mouseenter="showTooltip($event, 'Polygon (G)')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
+                    <Hexagon :size="18" />
+                </button>
             </div>
         </div>
 
@@ -3234,10 +2878,6 @@ function handleFileUpload(event: Event) {
                 @mouseenter="showTooltip($event, 'Vectorize Image (Q)')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
           <Zap :size="18" />
         </button>
-        <button :class="{ active: activeTool === 'warp' }" @click="startWarp" 
-                @mouseenter="showTooltip($event, 'Mesh Warp (Fabric)')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
-          <Grid :size="18" />
-        </button>
         <button :class="{ active: activeTool === 'adjustment' }" @click="activeTool = 'adjustment'" 
                 @mouseenter="showTooltip($event, 'Adjustment Layer')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
           <Settings :size="18" />
@@ -3265,13 +2905,6 @@ function handleFileUpload(event: Event) {
 
       <div class="workspace-area">
         <div class="top-context-bar">
-          <template v-if="warpState.isWarping">
-            <div class="context-control">
-              <span class="context-label">Mesh Warp Active</span>
-              <button class="context-btn primary" @click="applyWarp">Apply</button>
-              <button class="context-btn" @click="cancelWarp">Cancel</button>
-            </div>
-          </template>
           <template v-if="targetImageId !== -1">
             <button :class="{ active: activeTool === 'eraser' }" @click="activeTool = 'eraser'" 
                     @mouseenter="showTooltip($event, 'Bitmap Eraser (E)')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
@@ -3310,12 +2943,12 @@ function handleFileUpload(event: Event) {
             <div class="context-divider"></div>
             <!-- Boolean Operations -->
             <div v-if="selectedIds.length >= 2" class="boolean-ops">
-              <button @click="booleanOp('union')" @mouseenter="showTooltip($event, 'Union (Pathfinder)')" @mousemove="moveTooltip" @mouseleave="hideTooltip"><Square :size="16" style="background: #555; border-radius: 2px" /></button>
-              <button @click="booleanOp('subtract')" @mouseenter="showTooltip($event, 'Subtract (Pathfinder)')" @mousemove="moveTooltip" @mouseleave="hideTooltip"><Square :size="16" style="clip-path: polygon(0 0, 100% 0, 100% 100%, 50% 100%, 50% 50%, 0 50%)" /></button>
-              <button @click="booleanOp('intersect')" @mouseenter="showTooltip($event, 'Intersect (Pathfinder)')" @mousemove="moveTooltip" @mouseleave="hideTooltip"><Circle :size="16" style="opacity: 0.5" /></button>
+              <button @click="booleanOp('union')" v-tooltip="'Union (Pathfinder)'"><Square :size="16" style="background: #555; border-radius: 2px" /></button>
+              <button @click="booleanOp('subtract')" v-tooltip="'Subtract (Pathfinder)'"><Square :size="16" style="clip-path: polygon(0 0, 100% 0, 100% 100%, 50% 100%, 50% 50%, 0 50%)" /></button>
+              <button @click="booleanOp('intersect')" v-tooltip="'Intersect (Pathfinder)'"><Circle :size="16" style="opacity: 0.5" /></button>
             </div>
             <!-- Masking -->
-            <button v-if="selectedIds.length === 1" @click="toggleMask" :class="{ active: selectedObject?.is_mask }" @mouseenter="showTooltip($event, 'Toggle as Mask')" @mousemove="moveTooltip" @mouseleave="hideTooltip">
+            <button v-if="selectedIds.length === 1" @click="toggleMask" :class="{ active: selectedObject?.is_mask }" v-tooltip="'Toggle as Mask'">
               <Zap :size="16" /> <!-- Placeholder icon for Mask -->
             </button>
           </template>
@@ -3324,19 +2957,17 @@ function handleFileUpload(event: Event) {
         <!-- Canvas Area -->
         <main class="canvas-area" ref="canvasContainer">
           <!-- Rulers -->
-          <template v-if="showRulers">
-            <div class="ruler-corner"></div>
-            <div class="ruler ruler-horizontal" @mousedown="startGuideDrag('horizontal')">
-              <div v-for="n in 100" :key="n" class="ruler-mark" :style="{ left: ((n-1)*100*viewport.zoom + viewport.x) + 'px' }">
-                {{ (n-1)*100 }}
-              </div>
+          <div class="ruler-corner"></div>
+          <div class="ruler ruler-horizontal" @mousedown="startGuideDrag('horizontal')">
+            <div v-for="n in 100" :key="n" class="ruler-mark" :style="{ left: ((n-1)*100*viewport.zoom + viewport.x) + 'px' }">
+              {{ (n-1)*100 }}
             </div>
-            <div class="ruler ruler-vertical" @mousedown="startGuideDrag('vertical')">
-              <div v-for="n in 100" :key="n" class="ruler-mark" :style="{ top: ((n-1)*100*viewport.zoom + viewport.y) + 'px' }">
-                {{ (n-1)*100 }}
-              </div>
+          </div>
+          <div class="ruler ruler-vertical" @mousedown="startGuideDrag('vertical')">
+            <div v-for="n in 100" :key="n" class="ruler-mark" :style="{ top: ((n-1)*100*viewport.zoom + viewport.y) + 'px' }">
+              {{ (n-1)*100 }}
             </div>
-          </template>
+          </div>
 
           <canvas 
             ref="canvas" 
@@ -3346,12 +2977,6 @@ function handleFileUpload(event: Event) {
             @pointercancel="handlePointerUp"
             @wheel.prevent="handleWheel"
             style="touch-action: none;"
-            :style="{ 
-              top: rulerSize + 'px', 
-              left: rulerSize + 'px', 
-              width: `calc(100% - ${rulerSize}px)`, 
-              height: `calc(100% - ${rulerSize}px)` 
-            }"
           ></canvas>
 
         <!-- Engine Load Error Overlay -->
@@ -3398,14 +3023,9 @@ function handleFileUpload(event: Event) {
           <section v-if="activeTool === 'brush'" class="panel brush-panel">
             <div class="panel-header">
                 <h3>Brush Settings</h3>
-                <div style="display: flex; gap: 4px;">
-                    <button @click="showBrushStudio = true" title="Open Brush Studio" class="icon-btn">
-                        <Palette :size="14" />
-                    </button>
-                    <button @click="importBrushTip" title="Import Brush Tip (PNG)" class="icon-btn">
-                        <Upload :size="14" />
-                    </button>
-                </div>
+                <button @click="importBrushTip" title="Import Brush Tip (PNG)" class="icon-btn">
+                    <Upload :size="14" />
+                </button>
             </div>
             <div class="property-grid">
               <label>Brush</label>
@@ -3637,18 +3257,19 @@ function handleFileUpload(event: Event) {
               <label>Offset Y</label>
               <input type="number" :value="selectedObject.shadow_offset_y" @input="e => updateSelected('shadow_offset_y', Number((e.target as HTMLInputElement).value))" />
               
-              <template v-if="selectedObject.shape_type === 'Intelligent'">
-                  <SmartParams 
-                    :metadata="intelligentShapesMetadata.find(m => m.id === selectedObject.intelligent_type)"
-                    :values="selectedObject.intelligent_params"
-                    @update="updateIntelligentParam" />
+              <template v-if="selectedObject.shape_type === 'Star' || selectedObject.shape_type === 'Polygon'">
+                  <label>Sides</label>
+                  <input type="number" :value="selectedObject.sides" @input="e => updateSelected('sides', Number((e.target as HTMLInputElement).value))" />
               </template>
 
-              <template v-if="selectedObject.shape_type === 'SmartBackground'">
-                  <SmartParams 
-                    :metadata="smartBackgroundsMetadata.find(m => m.id === selectedObject.intelligent_type)"
-                    :values="selectedObject.intelligent_params"
-                    @update="updateIntelligentParam" />
+              <template v-if="selectedObject.shape_type === 'Rectangle'">
+                  <label>Corners</label>
+                  <input type="range" min="0" max="100" step="1" :value="selectedObject.corner_radius" @input="e => updateSelected('corner_radius', Number((e.target as HTMLInputElement).value))" />
+              </template>
+
+              <template v-if="selectedObject.shape_type === 'Star'">
+                  <label>Inner R.</label>
+                  <input type="range" min="0" max="1" step="0.05" :value="selectedObject.inner_radius" @input="e => updateSelected('inner_radius', Number((e.target as HTMLInputElement).value))" />
               </template>
 
               <template v-if="selectedObject.shape_type === 'Text'">
@@ -3970,16 +3591,6 @@ function handleFileUpload(event: Event) {
     <div v-if="tooltip.show" class="custom-tooltip" :style="{ left: (tooltip.x + 10) + 'px', top: (tooltip.y + 10) + 'px' }">
       {{ tooltip.text }}
     </div>
-
-    <BrushStudio 
-      v-if="showBrushStudio" 
-      :brushes="brushes"
-      v-model:selectedId="selectedBrushId"
-      @update-brush="updateBrushById"
-      @create-brush="createBrush"
-      @import-tip="importBrushTip"
-      @close="showBrushStudio = false"
-    />
   </div>
 </template>
 
@@ -4102,74 +3713,6 @@ function handleFileUpload(event: Event) {
 
 .menu-item:hover .dropdown {
   display: block;
-}
-
-.flyout-divider {
-  height: 1px;
-  background: #444;
-  margin: 4px 0;
-}
-
-.flyout-header {
-  font-size: 9px;
-  color: #666;
-  padding: 4px 8px;
-  font-weight: bold;
-}
-
-.intelligent-shapes-grid {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 4px;
-  padding: 8px;
-}
-
-.smart-backgrounds-list {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  padding: 4px;
-  min-width: 140px;
-}
-
-.smart-bg-btn {
-  display: flex;
-  align-items: center;
-  padding: 8px 12px;
-  border: none;
-  background: transparent;
-  color: #ccc;
-  cursor: pointer;
-  border-radius: 4px;
-  font-size: 12px;
-  text-align: left;
-  transition: all 0.2s;
-  width: 100%;
-}
-
-.smart-bg-btn:hover {
-  background: rgba(255, 255, 255, 0.1);
-  color: white;
-}
-
-.intelligent-shape-btn {
-  display: flex !important;
-  align-items: center;
-  justify-content: center !important;
-  padding: 6px !important;
-  width: 32px !important;
-  height: 32px !important;
-  border-radius: 4px;
-}
-
-.shape-icon-mini {
-  width: 18px;
-  height: 18px;
-  color: #ccc;
-}
-
-.intelligent-shape-btn:hover .shape-icon-mini {
-  color: white;
 }
 
 .dropdown button {
@@ -4527,40 +4070,6 @@ function handleFileUpload(event: Event) {
     accent-color: #4facfe;
 }
 
-.context-btn {
-    padding: 4px 10px;
-    background: #333;
-    border: 1px solid #444;
-    color: #eee;
-    border-radius: 4px;
-    font-size: 11px;
-    cursor: pointer;
-    height: 24px;
-    display: flex;
-    align-items: center;
-}
-
-.context-btn:hover {
-    background: #444;
-}
-
-.context-btn.primary {
-    background: #4facfe;
-    border-color: #4facfe;
-    color: white;
-    font-weight: 600;
-}
-
-.context-btn.primary:hover {
-    background: #0088ff;
-}
-
-.context-label {
-    margin-right: 4px;
-    font-weight: 600;
-    color: #4facfe;
-}
-
 /* Toolbar */
 .toolbar-side {
   width: 45px;
@@ -4614,7 +4123,7 @@ function handleFileUpload(event: Event) {
     border: 1px solid #333;
     border-radius: 0 6px 6px 0;
     display: flex;
-    flex-direction: column;
+    flex-direction: row;
     padding: 4px;
     gap: 4px;
     z-index: 100;
@@ -4641,14 +4150,18 @@ function handleFileUpload(event: Event) {
 
 .canvas-area canvas {
   position: absolute;
+  top: 30px;
+  left: 30px;
+  width: calc(100% - 30px);
+  height: calc(100% - 30px);
 }
 
 .ruler-corner {
   position: absolute;
   top: 0;
   left: 0;
-  width: 20px;
-  height: 20px;
+  width: 30px;
+  height: 30px;
   background: #252525;
   z-index: 11;
   border-right: 1px solid #333;
@@ -4666,17 +4179,17 @@ function handleFileUpload(event: Event) {
 
 .ruler-horizontal {
   top: 0;
-  left: 20px;
+  left: 30px;
   right: 0;
-  height: 20px;
+  height: 30px;
   border-bottom: 1px solid #333;
 }
 
 .ruler-vertical {
-  top: 20px;
+  top: 30px;
   left: 0;
   bottom: 0;
-  width: 20px;
+  width: 30px;
   border-right: 1px solid #333;
 }
 

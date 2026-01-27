@@ -38,6 +38,9 @@ pub struct VectorObject {
     pub inner_radius: f64,
     pub corner_radius: f64,
     pub path_data: String,
+    // Intelligent shape specific
+    pub intelligent_type: String,
+    pub intelligent_params: Vec<f64>,
     // Brush specific
     pub brush_id: u32,
     pub stroke_points: Vec<StrokePoint>,
@@ -254,6 +257,14 @@ impl VectorObject {
                     points.push(format!("{},{}", x, y));
                 }
                 format!(r##"<polygon points="{}" {} />"##, points.join(" "), attr_str)
+            }
+            ShapeType::Intelligent => {
+                if let Some(shape_def) = crate::intelligent_shapes::get_shape_by_id(&self.intelligent_type) {
+                    let path_str = shape_def.generate_path(self.width, self.height, &self.intelligent_params);
+                    format!(r##"<path d="{}" {} />"##, path_str, attr_str)
+                } else {
+                    String::new()
+                }
             }
             ShapeType::Text => {
                 format!(r##"<text x="0" y="{}" font-family="{}" font-size="{}" font-weight="{}" text-anchor="{}" {}>{}</text>"##,

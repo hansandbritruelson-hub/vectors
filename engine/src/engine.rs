@@ -144,4 +144,10 @@ impl VectorEngine {
     pub fn get_selected_ids(&self) -> String {
         serde_json::to_string(&self.selected_ids).unwrap_or("[]".to_string())
     }
+
+    pub fn set_objects(&mut self, objects_json: &str) {
+        if let Ok(objs) = serde_json::from_str::<Vec<VectorObject>>(objects_json) {
+            self.objects = objs;
+        }
+    }
 }

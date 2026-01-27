@@ -35,7 +35,14 @@ const currentDepth = props.depth || 0;
             <component :is="obj.visible ? Eye : EyeOff" :size="14" />
         </button>
         <span class="layer-icon">
-            <Square v-if="obj.shape_type === 'Rectangle'" :size="14" />
+            <template v-if="obj.shape_type === 'Intelligent'">
+                <Square v-if="obj.intelligent_type === 'rectangle'" :size="14" />
+                <Circle v-else-if="obj.intelligent_type === 'circle'" :size="14" />
+                <Star v-else-if="obj.intelligent_type === 'star'" :size="14" />
+                <Hexagon v-else-if="obj.intelligent_type === 'polygon'" :size="14" />
+                <component v-else :is="Star" :size="14" style="color: #ffcc00;" />
+            </template>
+            <Square v-else-if="obj.shape_type === 'Rectangle'" :size="14" />
             <Circle v-else-if="obj.shape_type === 'Circle'" :size="14" />
             <component :is="Circle" v-else-if="obj.shape_type === 'Ellipse'" :size="14" class="ellipse-icon" />
             <Star v-else-if="obj.shape_type === 'Star'" :size="14" />

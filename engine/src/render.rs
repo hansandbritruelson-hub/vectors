@@ -134,7 +134,8 @@ impl VectorEngine {
     }
 
     fn render_object(&self, ctx: &CanvasRenderingContext2d, obj: &VectorObject) {
-        if !obj.visible || obj.is_mask { return; }
+        if !obj.visible { return; }
+        if obj.is_mask && obj.shape_type != ShapeType::SmartBackground { return; }
         ctx.save();
         if let Some(mask_id) = obj.mask_id {
             if let Some(mask_obj) = self.objects.iter().find(|o| o.id == mask_id) {
@@ -250,6 +251,18 @@ impl VectorEngine {
                     ctx.fill();
                     if obj.stroke_width > 0.0 { ctx.stroke(); }
                 }
+                ShapeType::Intelligent => {
+                    if let Some(shape_def) = crate::intelligent_shapes::get_shape_by_id(&obj.intelligent_type) {
+                        let path_str = shape_def.generate_path(obj.width, obj.height, &obj.intelligent_params);
+                        if let Ok(p) = Path2d::new_with_path_string(&path_str) {
+                            ctx.fill_with_path_2d(&p);
+                            if obj.stroke_width > 0.0 { ctx.stroke_with_path(&p); }
+                        }
+                    }
+                }
+                ShapeType::SmartBackground => {
+                    self.render_smart_background(ctx, obj);
+                }
                 ShapeType::Image => {
                     if let Some(img_val) = &obj.image {
                         if let Some(img) = img_val.dyn_ref::<web_sys::HtmlImageElement>() {
@@ -308,6 +321,10 @@ impl VectorEngine {
             }
             ShapeType::Polygon => { self.draw_poly(ctx, obj.width / 2.0, obj.height / 2.0, obj.width / 2.0, obj.sides, 0.0); }
             ShapeType::Star => { self.draw_star(ctx, obj.width / 2.0, obj.height / 2.0, obj.width / 2.0, obj.inner_radius * (obj.width / 2.0), obj.sides); }
+            ShapeType::Intelligent => {
+                ctx.begin_path();
+                ctx.rect(0.0, 0.0, obj.width, obj.height);
+            }
             _ => { ctx.begin_path(); ctx.rect(0.0, 0.0, obj.width, obj.height); }
         }
     }
@@ -344,5 +361,11 @@ impl VectorEngine {
             if i == 0 { ctx.move_to(x, y); } else { ctx.line_to(x, y); }
         }
         ctx.close_path();
+    }
+
+    fn render_smart_background(&self, ctx: &CanvasRenderingContext2d, obj: &VectorObject) {
+        if let Some(bg_def) = crate::smart_backgrounds::get_background_by_id(&obj.intelligent_type) {
+            bg_def.render(ctx, obj.width, obj.height, &obj.intelligent_params);
+        }
     }
 }

@@ -130,6 +130,8 @@ impl VectorEngine {
                     Some("Star") => ShapeType::Star, Some("Polygon") => ShapeType::Polygon,
                     Some("Image") => ShapeType::Image, Some("Path") => ShapeType::Path,
                     Some("Text") => ShapeType::Text, Some("Group") => ShapeType::Group,
+                    Some("Intelligent") => ShapeType::Intelligent,
+                    Some("SmartBackground") => ShapeType::SmartBackground,
                     _ => ShapeType::Rectangle,
                 };
                 let id = self.add_object(st, cmd.params["x"].as_f64().unwrap_or(0.0), cmd.params["y"].as_f64().unwrap_or(0.0), cmd.params["width"].as_f64().unwrap_or(100.0), cmd.params["height"].as_f64().unwrap_or(100.0), cmd.params["fill"].as_str().unwrap_or("#4facfe"));
@@ -179,7 +181,7 @@ impl VectorEngine {
                 else { self.selected_ids.clear(); }
                 "{ \"success\": true }".to_string()
             }
-            "move_to_back" => {
+            "send_to_back" | "move_to_back" => {
                 self.save_state("Move to Back");
                 let id = cmd.params["id"].as_u64().map(|v| v as u32).unwrap_or(0);
                 if let Some(pos) = self.objects.iter().position(|o| o.id == id) {
@@ -300,7 +302,10 @@ impl VectorEngine {
         let id = self.next_id;
         let name = format!("{:?} {}", shape_type, id);
         self.objects.push(VectorObject {
-            id, shape_type, name, x, y, width, height, rotation: 0.0, fill: fill.to_string(), stroke: "#000000".to_string(), stroke_width: 1.0, opacity: 1.0, visible: true, locked: false, blend_mode: "source-over".to_string(), stroke_cap: "butt".to_string(), stroke_join: "miter".to_string(), stroke_dash: Vec::new(), layer_style: LayerStyle::default(), mask_id: None, is_mask: false, sides: 5, inner_radius: 0.5, corner_radius: 0.0, path_data: String::new(), brush_id: 0, stroke_points: Vec::new(), text_content: "Type here...".to_string(), font_family: "Inter, sans-serif".to_string(), font_size: 24.0, font_weight: "normal".to_string(), text_align: "left".to_string(), kerning: 0.0, leading: 1.2, tracking: 0.0, shadow_color: "transparent".to_string(), shadow_blur: 0.0, shadow_offset_x: 0.0, shadow_offset_y: 0.0, sx: 0.0, sy: 0.0, sw: 0.0, sh: 0.0, brightness: 1.0, contrast: 1.0, saturate: 1.0, hue_rotate: 0.0, blur: 0.0, grayscale: 0.0, sepia: 0.0, invert: 0.0, raw_image: None, raw_rgba: None, raw_rgba_width: 0, raw_rgba_height: 0, image: None, fill_gradient: None, stroke_gradient: None, children: None,
+            id, shape_type, name, x, y, width, height, rotation: 0.0, fill: fill.to_string(), stroke: "#000000".to_string(), stroke_width: 1.0, opacity: 1.0, visible: true, locked: false, blend_mode: "source-over".to_string(), stroke_cap: "butt".to_string(), stroke_join: "miter".to_string(), stroke_dash: Vec::new(), layer_style: LayerStyle::default(), mask_id: None, is_mask: false, sides: 5, inner_radius: 0.5, corner_radius: 0.0, path_data: String::new(), 
+            intelligent_type: String::new(),
+            intelligent_params: Vec::new(),
+            brush_id: 0, stroke_points: Vec::new(), text_content: "Type here...".to_string(), font_family: "Inter, sans-serif".to_string(), font_size: 24.0, font_weight: "normal".to_string(), text_align: "left".to_string(), kerning: 0.0, leading: 1.2, tracking: 0.0, shadow_color: "transparent".to_string(), shadow_blur: 0.0, shadow_offset_x: 0.0, shadow_offset_y: 0.0, sx: 0.0, sy: 0.0, sw: 0.0, sh: 0.0, brightness: 1.0, contrast: 1.0, saturate: 1.0, hue_rotate: 0.0, blur: 0.0, grayscale: 0.0, sepia: 0.0, invert: 0.0, raw_image: None, raw_rgba: None, raw_rgba_width: 0, raw_rgba_height: 0, image: None, fill_gradient: None, stroke_gradient: None, children: None,
         });
         self.next_id += 1;
         id
@@ -353,6 +358,10 @@ impl VectorEngine {
             if let Some(v) = params["sides"].as_u64() { obj.sides = v as u32; }
             if let Some(v) = params["inner_radius"].as_f64() { obj.inner_radius = v; }
             if let Some(v) = params["corner_radius"].as_f64() { obj.corner_radius = v; }
+            if let Some(v) = params["intelligent_type"].as_str() { obj.intelligent_type = v.to_string(); }
+            if let Some(arr) = params["intelligent_params"].as_array() {
+                obj.intelligent_params = arr.iter().filter_map(|v| v.as_f64()).collect();
+            }
             if let Some(v) = params["path_data"].as_str() { obj.path_data = v.to_string(); }
             if let Some(v) = params["brush_id"].as_u64() { obj.brush_id = v as u32; }
             if let Some(pts) = params["stroke_points"].as_array() {
